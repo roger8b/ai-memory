@@ -2254,30 +2254,6 @@ mod tests {
 
     // ---- Mavis plugin package ----
 
-    /// Unquote a POSIX single-quoted token the way a shell would, so a test
-    /// can assert on the *logical* argv rather than the quoting we emitted.
-    fn unquote_posix(token: &str) -> String {
-        if !token.starts_with('\'') {
-            return token.to_string();
-        }
-        let mut out = String::new();
-        let mut chars = token.chars();
-        chars.next();
-        while let Some(ch) = chars.next() {
-            if ch == '\'' {
-                // `'\''` — the shell closes, escapes a literal quote, reopens.
-                if chars.next() == Some('\\') && chars.next() == Some('\'') {
-                    out.push('\'');
-                    chars.next();
-                    continue;
-                }
-                break;
-            }
-            out.push(ch);
-        }
-        out
-    }
-
     fn mavis_handler<'a>(
         document: &'a serde_json::Value,
         event: &str,
@@ -2333,7 +2309,7 @@ mod tests {
                 .as_str()
                 .expect("command string")
                 .to_string();
-            let argv: Vec<String> = command.split_whitespace().map(unquote_posix).collect();
+            let argv = split_shell_words(&command);
             assert_eq!(
                 argv.iter().filter(|a| a.as_str() == "hook").count(),
                 1,
@@ -2475,6 +2451,105 @@ mod tests {
                 !is_our_mavis_hook_command(foreign),
                 "must not claim a foreign command: {foreign}"
             );
+        }
+    }
+
+    /// Split a shell command string into logical words the way a POSIX shell
+    /// would: whitespace inside single or double quotes is NOT a separator.
+    ///
+    /// `split_whitespace` is wrong here — an argument like
+    /// `/tmp/a dir/o'brien` is quoted as one word by the shell, but
+    /// whitespace-splitting tears it in two and produces a nonsense argv.
+    /// Handles `'…'` (literal, no escapes), `"…"` (backslash escapes) and
+    /// bare backslash escapes.
+    fn split_shell_words(command: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut has_word = false;
+        let mut chars = command.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                c if c.is_whitespace() => {
+                    if has_word {
+                        words.push(std::mem::take(&mut current));
+                        has_word = false;
+                    }
+                }
+                '\'' => {
+                    has_word = true;
+                    for inner in chars.by_ref() {
+                        if inner == '\'' {
+                            break;
+                        }
+                        current.push(inner);
+                    }
+                }
+                '"' => {
+                    has_word = true;
+                    while let Some(inner) = chars.next() {
+                        match inner {
+                            '"' => break,
+                            '\\' => {
+                                if let Some(escaped) = chars.next() {
+                                    current.push(escaped);
+                                }
+                            }
+                            other => current.push(other),
+                        }
+                    }
+                }
+                '\\' => {
+                    has_word = true;
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                }
+                other => {
+                    has_word = true;
+                    current.push(other);
+                }
+            }
+        }
+        if has_word {
+            words.push(current);
+        }
+        words
+    }
+
+    /// Structural version of the check above: feed the generated argv to the
+    /// REAL clap parser instead of a hardcoded flag list.
+    ///
+    /// The hardcoded list can only catch a flag that disappears; it cannot
+    /// catch a flag that is renamed in `HookArgs`, or a `hook` argument that
+    /// becomes a positional. Parsing proves the command the installer writes
+    /// is one this binary actually accepts — which is exactly the class of
+    /// bug that shipped a stray trailing `hook` and made all nine handlers
+    /// exit 2.
+    #[test]
+    fn mavis_generated_argv_parses_with_the_real_cli_parser() {
+        use clap::CommandFactory as _;
+        let doc = build_mavis_hooks_document(
+            "http://127.0.0.1:49374",
+            Some("tok'en with spaces"),
+            Some(Path::new("/tmp/a dir/o'brien/ai-memory")),
+            Some("repo-root"),
+        );
+        for (event, _) in MAVIS_EVENTS {
+            for field in ["command", "commandWindows"] {
+                let raw = mavis_handler(&doc, event)[field]
+                    .as_str()
+                    .expect(field)
+                    .to_string();
+                let argv = split_shell_words(&raw);
+                // argv[0] is the binary; clap wants the program name first.
+                let mut full = vec!["ai-memory".to_string()];
+                full.extend_from_slice(&argv[1..]);
+                crate::cli::Cli::command()
+                    .try_get_matches_from(&full)
+                    .unwrap_or_else(|e| {
+                        panic!("{event}/{field} is not a valid command: {e}\n  {raw}")
+                    });
+            }
         }
     }
 

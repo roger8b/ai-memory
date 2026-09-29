@@ -1934,3 +1934,97 @@ fn mavis_dry_run_writes_nothing() {
         "dry run must not create the package"
     );
 }
+
+// The `MINIMAX_DATA_DIR` override is an unverified opt-in (Mavis resolves
+// its own data dir at runtime; no public documentation of the variable was
+// found). The two halves of the integration resolve it through one shared
+// helper precisely so they cannot drift — these tests hold that promise.
+
+#[test]
+fn mavis_data_dir_override_moves_both_the_plugin_package_and_the_mcp_config() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let relocated = home.path().join("relocated-minimax");
+    std::fs::create_dir_all(&relocated).unwrap();
+    std::fs::write(
+        relocated.join("mcp.json"),
+        r#"{"mcpServers":{"other":{"type":"http","url":"https://other.example/mcp"}}}"#,
+    )
+    .unwrap();
+
+    // Point the agent data dir away from HOME. Both installs must follow it,
+    // and neither may touch the default ~/.minimax location.
+    let install = command_with_home(home.path())
+        .env("MINIMAX_DATA_DIR", &relocated)
+        .args(["install-hooks", "--agent", "mavis", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "hooks install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let mcp_install = command_with_home(home.path())
+        .env("MINIMAX_DATA_DIR", &relocated)
+        .args(["install-mcp", "--client", "mavis", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        mcp_install.status.success(),
+        "mcp install failed: {}",
+        String::from_utf8_lossy(&mcp_install.stderr)
+    );
+
+    assert!(
+        relocated
+            .join("plugins/ai-memory-mavis/hooks/hooks.json")
+            .exists(),
+        "the hook package must follow MINIMAX_DATA_DIR"
+    );
+    let mcp: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(relocated.join("mcp.json")).unwrap())
+            .unwrap();
+    assert!(
+        mcp["mcpServers"]["ai-memory"].get("url").is_some(),
+        "the MCP entry must land in the same relocated dir"
+    );
+    assert!(
+        !home.path().join(".minimax").exists(),
+        "the default ~/.minimax must stay untouched when the override is set"
+    );
+
+    // Uninstall must follow the same override, or it would sweep the default
+    // location instead and leave the real package behind.
+    let uninstall = command_with_home(home.path())
+        .env("MINIMAX_DATA_DIR", &relocated)
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .output()
+        .unwrap();
+    assert!(uninstall.status.success());
+    assert!(
+        !relocated
+            .join("plugins/ai-memory-mavis/hooks/hooks.json")
+            .exists(),
+        "uninstall must withdraw the package from the relocated dir"
+    );
+}
+
+#[test]
+fn mavis_empty_data_dir_override_falls_back_to_the_default() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+
+    // An exported-but-empty MINIMAX_DATA_DIR must not resolve to a relative
+    // "mcp.json" in the current directory. It has to fall back to
+    // $HOME/.minimax like an unset variable does.
+    let install = command_with_home(home.path())
+        .env("MINIMAX_DATA_DIR", "")
+        .args(["install-hooks", "--agent", "mavis", "--apply"])
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+    assert!(
+        mavis_root(home.path()).join("hooks/hooks.json").exists(),
+        "an empty override must fall back to $HOME/.minimax"
+    );
+}
