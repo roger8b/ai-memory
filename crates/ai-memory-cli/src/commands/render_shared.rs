@@ -2553,6 +2553,101 @@ mod tests {
         }
     }
 
+    /// The MiniMax Plugin V1 contract is enforced by the runtime: unknown
+    /// manifest fields, a name outside its regex, or a category outside its
+    /// fixed list can make the runtime reject the whole package — which would
+    /// take capture down silently, with no error surfaced to the operator.
+    /// These assertions are transcribed from the runtime's own documented
+    /// rules, not from this implementation's assumptions.
+    #[test]
+    fn mavis_manifest_satisfies_the_plugin_v1_contract() {
+        let m = build_mavis_plugin_manifest();
+        let obj = m.as_object().expect("manifest object");
+
+        const REQUIRED: [&str; 11] = [
+            "schemaVersion",
+            "name",
+            "version",
+            "description",
+            "author",
+            "icon",
+            "category",
+            "exampleQueries",
+            "apps",
+            "mcpServers",
+            "skills",
+        ];
+        for field in REQUIRED {
+            assert!(obj.contains_key(field), "required manifest field {field}");
+        }
+        // The contract says "no unknown fields"; only these plus the three
+        // documented optionals may appear.
+        const OPTIONAL: [&str; 3] = ["displayName", "darkIcon", "hooks"];
+        for key in obj.keys() {
+            assert!(
+                REQUIRED.contains(&key.as_str()) || OPTIONAL.contains(&key.as_str()),
+                "undocumented manifest field {key}"
+            );
+        }
+        assert_eq!(m["schemaVersion"], 1);
+
+        let name = m["name"].as_str().expect("name");
+        assert!(
+            name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c)),
+            "plugin name must match the runtime regex: {name}"
+        );
+        // The package DIRECTORY must equal the manifest name; the runtime
+        // resolves the package by that name.
+        assert_eq!(name, "ai-memory-mavis");
+
+        let version = m["version"].as_str().expect("version");
+        assert!(
+            version.split('.').count() == 3
+                && version
+                    .split('.')
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+            "version must be SemVer: {version}"
+        );
+
+        const CATEGORIES: [&str; 10] = [
+            "Office",
+            "Studio",
+            "Design & Sites",
+            "Code",
+            "Business",
+            "Sales",
+            "Productivity",
+            "Science & Healthcare",
+            "Education",
+            "Other",
+        ];
+        let category = m["category"].as_str().expect("category");
+        assert!(
+            CATEGORIES.contains(&category),
+            "category {category:?} is not one the runtime accepts"
+        );
+
+        assert!(
+            m["apps"].as_array().is_some_and(|a| a.is_empty()),
+            "local App references are ignored; apps must stay []"
+        );
+        assert!(
+            m["exampleQueries"].as_array().is_some_and(|q| !q.is_empty()
+                && q.iter()
+                    .all(|s| s.as_str().is_some_and(|t| !t.trim().is_empty()))),
+            "every example query needs non-whitespace text"
+        );
+        // Omitting darkIcon is explicitly allowed when only a default icon
+        // exists; pairing a light icon with an unrelated dark one is not.
+        assert!(
+            m.get("darkIcon").is_none(),
+            "no dark variant is generated, so darkIcon must be absent"
+        );
+    }
+
     #[test]
     fn shell_quoting_protects_special_characters() {
         assert_eq!(shell_quote_posix("plain"), "plain");
