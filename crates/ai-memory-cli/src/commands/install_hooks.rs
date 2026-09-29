@@ -219,6 +219,55 @@ pub(crate) fn zcode_config_path() -> anyhow::Result<std::path::PathBuf> {
         .join("config.json"))
 }
 
+/// Whether a `type: "command"` string is an ai-memory Mavis hook.
+///
+/// Re-exported so the uninstall path can prove ownership from the generated
+/// document alone. Mavis documents no `statusMessage`-style marker field for
+/// handlers, so the test keys on the unambiguous flag pair every command we
+/// generate carries: `--event <name>` followed by `--agent mavis`.
+pub(crate) use super::render_shared::is_our_mavis_hook_command;
+
+/// Root of the generated MiniMax Code (Mavis) Plugin V1 package.
+///
+/// Mavis has no user-scope hooks file: its lifecycle surface is a *package*
+/// under the agent data dir's `plugins/` tree, so this is a directory we own
+/// rather than a JSON document we merge into. `MINIMAX_DATA_DIR` overrides the
+/// default the same way `KIRO_HOME` / `GROK_HOME` do for those agents, so a
+/// non-default profile installs into the right tree.
+pub(crate) fn mavis_plugin_root() -> anyhow::Result<std::path::PathBuf> {
+    // Resolved through the *same* helper `install-mcp --client mavis` uses, so
+    // the hook package and the MCP config can never land in different
+    // profiles — a split would leave capture running with no memory tools.
+    Ok(crate::commands::install_mcp::mavis_data_dir()?
+        .join("plugins")
+        .join("ai-memory-mavis"))
+}
+
+/// Generated 32x32 RGBA placeholder icon for the Mavis plugin package.
+///
+/// A solid slate-blue vertical gradient. The runtime only requires a valid,
+/// correctly-typed icon, and shipping one keeps the installer from having to
+/// ask the operator for artwork before capture can be installed. The manifest
+/// deliberately omits `darkIcon` rather than pairing a light default with an
+/// unrelated bundled dark image.
+pub(crate) const MAVIS_ICON_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x08, 0x06, 0x00, 0x00, 0x00, 0x73, 0x7a, 0x7a,
+    0xf4, 0x00, 0x00, 0x00, 0xaa, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0xc5, 0xce, 0x47, 0x12, 0x82,
+    0x50, 0x00, 0x04, 0xd1, 0xb9, 0x8f, 0x22, 0x49, 0xc0, 0x12, 0x13, 0x06, 0x4c, 0xe8, 0x01, 0xcc,
+    0x39, 0x67, 0xbd, 0xff, 0xf8, 0x6f, 0x31, 0x8b, 0x57, 0xd5, 0xcb, 0x46, 0xae, 0x3c, 0xa1, 0x12,
+    0xf4, 0x03, 0xf1, 0x94, 0x4a, 0xc8, 0xc7, 0x33, 0x2a, 0x21, 0x5f, 0x99, 0x53, 0x09, 0x56, 0x75,
+    0x41, 0x25, 0x33, 0xb0, 0xa4, 0x12, 0xac, 0x9a, 0x09, 0x21, 0x14, 0xea, 0x2b, 0x2a, 0x99, 0x81,
+    0x35, 0x95, 0x60, 0x37, 0x36, 0x54, 0x82, 0x9d, 0x6c, 0xa9, 0x04, 0x27, 0xd9, 0x51, 0x09, 0x4e,
+    0xd3, 0x84, 0x10, 0x9c, 0xd6, 0x9e, 0x4a, 0x70, 0x5b, 0x07, 0x2a, 0xc1, 0x6d, 0x1f, 0xa9, 0x04,
+    0xaf, 0x7d, 0xa2, 0x12, 0xbc, 0xce, 0x99, 0x4a, 0xf0, 0x52, 0x13, 0x42, 0xf0, 0xd3, 0x0b, 0x95,
+    0xe0, 0x77, 0xaf, 0x54, 0x42, 0xb1, 0x77, 0xa3, 0x92, 0x19, 0xb8, 0x53, 0x09, 0x41, 0xff, 0x41,
+    0x25, 0x04, 0x03, 0x13, 0x42, 0x66, 0xe0, 0x49, 0x25, 0x84, 0xc3, 0x17, 0x95, 0x10, 0x66, 0x6f,
+    0x2a, 0x21, 0xca, 0x3e, 0x54, 0x42, 0x34, 0xfa, 0x52, 0x09, 0xa5, 0xf1, 0x8f, 0x4a, 0x7f, 0x36,
+    0x90, 0x68, 0xca, 0xc6, 0xf8, 0x45, 0x58, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
 /// `~/.devin/hooks.v1.json` — Devin CLI lifecycle hooks (default target).
 pub(crate) fn devin_hooks_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -606,6 +655,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),
+            AgentChoice::Mavis => apply_to_mavis_plugin(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Devin => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -748,6 +798,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         }
         AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Zcode => render_zcode(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::Mavis => render_mavis(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Devin => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -959,6 +1010,14 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Grok => grok_hooks_path().ok()?,
             AgentChoice::Zero => zero_hooks_path().ok()?,
             AgentChoice::Zcode => zcode_config_path().ok()?,
+            // The generated Mavis package is a directory, so the "config
+            // file" a project-strategy re-read looks for is the manifest
+            // inside it. Returning the *directory* would make the read fail
+            // with EISDIR and silently lose any previously baked strategy.
+            AgentChoice::Mavis => mavis_plugin_root()
+                .ok()?
+                .join(".minimax-plugin")
+                .join("plugin.json"),
             AgentChoice::Devin => devin_hooks_path().ok()?,
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
             AgentChoice::KiroCli => return None,
@@ -1256,6 +1315,12 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["mcpServers", "ai-memory"],
             "url",
         )),
+        // Mavis keeps a plain `mcpServers` map at the root of mcp.json.
+        McpClient::Mavis => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
         McpClient::KimiCode | McpClient::KiroCli => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
@@ -1351,6 +1416,9 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // no `McpClient::Zcode` whose config the installer could scrape a
         // server URL or token from.
         AgentChoice::Zcode => None,
+        // Mavis does ship an MCP client (`install-mcp --client mavis`), so
+        // the installer can read back a server URL or token from it.
+        AgentChoice::Mavis => Some(McpClient::Mavis),
     }
 }
 
@@ -5584,6 +5652,139 @@ fn render_zcode(
     println!("#       `ai-memory finalize-session --agent zcode`.");
     println!();
     println!("{serialized}");
+    Ok(())
+}
+
+/// Write one generated JSON file of the Mavis plugin package.
+///
+/// Routed through `apply_atomic` like every other agent's config write: it
+/// stages a tmp file, renames, and keeps a timestamped backup of the prior
+/// bytes. That backup matters more here than for a merged settings file —
+/// these documents are wholly ours, so an operator who hand-added a hook to
+/// `hooks.json` would otherwise lose it on the next re-apply with no way back.
+fn write_generated_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let mut body = serde_json::to_string_pretty(value)
+        .with_context(|| format!("serializing {}", path.display()))?;
+    body.push('\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    apply_atomic(path, move |_| Ok(body.clone()))?;
+    Ok(())
+}
+
+/// Write the MiniMax Code (Mavis) Plugin V1 package.
+///
+/// Mavis is the only agent whose hook surface is a *package* rather than a
+/// settings document, so this creates a small directory tree instead of
+/// merging keys into a user config. That also makes the ownership question
+/// unusually simple: everything under `ai-memory-mavis/` belongs to us, so
+/// re-apply overwrites our own files wholesale and there is no third-party
+/// hook to preserve inside them. The one thing that is *not* overwritten is
+/// an `icon.png` the operator replaced with their own artwork — we only write
+/// the placeholder when no icon is present.
+///
+/// Sibling plugins under `plugins/` are never touched.
+fn apply_to_mavis_plugin(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let root = match &args.config_file {
+        Some(p) => p.clone(),
+        None => mavis_plugin_root()?,
+    };
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let hooks_dir = root.join("hooks");
+    let manifest_dir = root.join(".minimax-plugin");
+    std::fs::create_dir_all(&hooks_dir)
+        .with_context(|| format!("creating Mavis plugin hooks dir {}", hooks_dir.display()))?;
+    std::fs::create_dir_all(&manifest_dir).with_context(|| {
+        format!(
+            "creating Mavis plugin manifest dir {}",
+            manifest_dir.display()
+        )
+    })?;
+
+    let manifest = super::render_shared::build_mavis_plugin_manifest();
+    let manifest_path = manifest_dir.join("plugin.json");
+    write_generated_json(&manifest_path, &manifest)?;
+
+    let hooks_doc = super::render_shared::build_mavis_hooks_document(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    write_generated_json(&hooks_dir.join("hooks.json"), &hooks_doc)?;
+
+    // Only seed the placeholder icon when none exists, so an operator-supplied
+    // icon survives every re-apply.
+    let icon = root.join("icon.png");
+    if !icon.exists() {
+        std::fs::write(&icon, MAVIS_ICON_PNG)
+            .with_context(|| format!("writing Mavis plugin icon {}", icon.display()))?;
+    }
+
+    println!("Installed Mavis plugin: {}", root.display());
+    println!("  manifest: {}", manifest_path.display());
+    println!("  hooks:    {}", hooks_dir.join("hooks.json").display());
+    println!(
+        "Mavis rescans local plugins automatically; no restart is needed. \
+         If it does not appear, check the Plugin panel for scan diagnostics."
+    );
+    Ok(())
+}
+
+/// Dry-run counterpart of [`apply_to_mavis_plugin`]: prints the manifest and
+/// hook document the apply path would write, so a hand-installed package is
+/// byte-for-byte what `--apply` produces.
+fn render_mavis(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    strategy: Option<&str>,
+) -> Result<()> {
+    let root = mavis_plugin_root()?;
+    let manifest = super::render_shared::build_mavis_plugin_manifest();
+    let hooks_doc = super::render_shared::build_mavis_hooks_document(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    println!("# MiniMax Code (Mavis) Plugin V1 package");
+    println!("# Package root: {}", root.display());
+    println!("# Files:");
+    println!("#   .minimax-plugin/plugin.json");
+    println!("#   hooks/hooks.json");
+    println!("#   icon.png            (only written when absent — yours is kept)");
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: the token is embedded in each hook command below.");
+        println!("#       Treat this package as sensitive.");
+        println!("#       NOTE: `--apply` does NOT embed the token; it persists it");
+        println!("#       to <data-dir>/auth-token (0600) and writes token-less");
+        println!("#       commands, so the applied package differs from this");
+        println!("#       printout by design (#552, #600).");
+    }
+    println!("# NOTE: Mavis injects SessionStart stdout as model context");
+    println!("#       (hookSpecificOutput.additionalContext), so the prior");
+    println!("#       session's handoff is delivered automatically.");
+    println!();
+    println!("# --- .minimax-plugin/plugin.json ---");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&manifest).context("serializing mavis plugin manifest")?
+    );
+    println!();
+    println!("# --- hooks/hooks.json ---");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&hooks_doc).context("serializing mavis hooks document")?
+    );
     Ok(())
 }
 

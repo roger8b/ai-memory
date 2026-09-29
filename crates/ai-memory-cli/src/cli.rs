@@ -1689,6 +1689,16 @@ pub enum AgentChoice {
     /// so close sessions with `ai-memory finalize-session --agent zcode`.
     #[value(alias = "zai")]
     Zcode,
+    /// MiniMax Code (Mavis) — a generated MiniMax Plugin V1 package under
+    /// the Mavis data dir (`~/.minimax/plugins/ai-memory-mavis/`). The
+    /// package manifest carries the lifecycle hook declarations; each entry
+    /// is an exec-form `type: "command"` that runs ai-memory's native
+    /// `hook` command directly, so no shell script is staged and no shell
+    /// is required (Mavis runs on Windows). Mavis injects `SessionStart`
+    /// stdout as model context (`hookSpecificOutput.additionalContext`),
+    /// so handoff delivery works.
+    #[value(alias = "minimax", alias = "minimax-code", alias = "mcode")]
+    Mavis,
 }
 
 impl AgentChoice {
@@ -1718,6 +1728,7 @@ impl AgentChoice {
             Self::CommandCode => AgentKind::CommandCode,
             Self::Pool => AgentKind::Pool,
             Self::Zcode => AgentKind::Zcode,
+            Self::Mavis => AgentKind::Mavis,
         }
     }
 
@@ -1735,7 +1746,8 @@ impl AgentChoice {
             | Self::Omp
             | Self::Openclaw
             | Self::Zero
-            | Self::Zcode => None,
+            | Self::Zcode
+            | Self::Mavis => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -1944,6 +1956,15 @@ pub enum McpClient {
     /// `SessionStart` output contract is not, so lifecycle capture and
     /// managed workstreams are not claimed. See `install-mcp --client muse`.
     Muse,
+    /// MiniMax Code (Mavis) — the `mcpServers` map in `~/.minimax/mcp.json`.
+    ///
+    /// Entries are `type: "http"` + `url` + optional `headers`, plus
+    /// `enabled` and `description`. The runtime's own bookkeeping keys
+    /// (`configured`, `builtin`) are deliberately not written: they describe
+    /// state Mavis owns, and overwriting them could make it believe a server
+    /// it never probed is already configured.
+    #[value(alias = "minimax", alias = "minimax-code", alias = "mcode")]
+    Mavis,
 }
 
 /// Arguments for `commit`.

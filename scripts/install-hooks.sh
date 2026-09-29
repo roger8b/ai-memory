@@ -9,7 +9,7 @@
 #   ai-memory-install-hooks --agent claude-code
 #
 # Options:
-#   --agent <claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|oh-my-pi|pi>
+#   --agent <claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|oh-my-pi|pi|mavis>
 #                                                which agent (default: claude-code;
 #                                                generated-plugin agents print hints)
 #   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
@@ -50,8 +50,9 @@ case "$AGENT" in
     commandcode|cmdc|cmd) AGENT="command-code" ;;
     kiro) AGENT="kiro-cli" ;;
     opencode-v2|open-code2) AGENT="opencode2" ;;
+    mavis|minimax|minimax-code|mcode) AGENT="mavis" ;;
     *)
-        echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | opencode2 | openclaw | omp | pi | oh-my-pi)" >&2
+        echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | opencode2 | openclaw | omp | pi | oh-my-pi | mavis)" >&2
         exit 64 ;;
 esac
 
@@ -97,6 +98,19 @@ if [[ "$AGENT" == "pi" ]]; then
     echo "Run: ai-memory install-hooks --agent pi --apply"
     echo "Then restart Pi so it loads ~/.pi/agent/extensions/ai-memory.ts."
     echo "MCP tools come through the same generated bridge extension."
+    exit 0
+fi
+
+if [[ "$AGENT" == "mavis" ]]; then
+    echo "MiniMax Code (Mavis) uses a generated Plugin V1 package, not shell hook"
+    echo "scripts. The package lives under <data-dir>/plugins/ai-memory-mavis/"
+    echo "(default ~/.minimax; set MINIMAX_DATA_DIR to override)."
+    echo
+    echo "Run: ai-memory install-hooks --agent mavis --apply"
+    echo "Each hook entry is an exec-form command, so no script is staged and no"
+    echo "shell is required. Mavis rescans local plugins automatically."
+    echo
+    echo "MCP tools are separate: ai-memory install-mcp --client mavis --apply"
     exit 0
 fi
 

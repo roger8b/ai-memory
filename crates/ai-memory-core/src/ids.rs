@@ -266,6 +266,8 @@ pub enum AgentKind {
     Pool,
     /// ZCode (z.ai) coding agent.
     Zcode,
+    /// MiniMax Code (Mavis) — the MiniMax agent runtime.
+    Mavis,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -276,7 +278,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -297,6 +299,7 @@ impl AgentKind {
         Self::Hermes,
         Self::Pool,
         Self::Zcode,
+        Self::Mavis,
         Self::Other,
     ];
 
@@ -324,6 +327,7 @@ impl AgentKind {
             Self::Hermes => "hermes",
             Self::Pool => "pool",
             Self::Zcode => "zcode",
+            Self::Mavis => "mavis",
             Self::Other => "other",
         }
     }
@@ -354,6 +358,7 @@ impl AgentKind {
             "hermes" | "hermes-agent" => Self::Hermes,
             "pool" | "poolside" => Self::Pool,
             "zcode" | "zai" => Self::Zcode,
+            "mavis" | "minimax" | "minimax-code" | "mcode" => Self::Mavis,
             _ => Self::Other,
         }
     }
@@ -391,6 +396,14 @@ impl AgentKind {
     /// `<system-reminder>` text block of the first user message sent to the
     /// model (verified live against the embedded engine v0.16.5, capture logs
     /// 2026-08-28), so its native hook fetches the handoff like Claude Code's.
+    ///
+    /// MiniMax Code (Mavis) DOES inject: its Plugin V1 hook contract documents
+    /// `hookSpecificOutput.additionalContext` as supported output for
+    /// `SessionStart`, and the envelope is byte-identical to the one this
+    /// crate's session-start hook already emits. Its tool payloads likewise
+    /// carry Claude Code's snake_case aliases (`tool_name`, `tool_input`,
+    /// `tool_use_id`), verified live 2026-09-29 across 37 `PreToolUse` and 35
+    /// `PostToolUse` events, so it shares the `tool_input` mapping too.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(

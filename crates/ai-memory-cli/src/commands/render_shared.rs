@@ -588,6 +588,230 @@ pub(crate) const ZCODE_HOOK_TIMEOUT_MS: u64 = 10_000;
 /// (same reasoning as Kiro v2's `max_output_size`).
 pub(crate) const ZCODE_HOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
+/// MiniMax Code (Mavis) lifecycle events, mapped to ai-memory's own event
+/// names. Mavis speaks Claude Code's vocabulary for all nine of them, and
+/// `SessionStart` injects `hookSpecificOutput.additionalContext` as model
+/// context, so the handoff is delivered on session start.
+pub(crate) const MAVIS_EVENTS: [(&str, &str); 9] = [
+    ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "user-prompt-submit"),
+    ("PreToolUse", "pre-tool-use"),
+    ("PostToolUse", "post-tool-use"),
+    ("PreCompact", "pre-compact"),
+    ("Stop", "stop"),
+    ("SessionEnd", "session-end"),
+    ("SubagentStart", "subagent-start"),
+    ("SubagentStop", "subagent-stop"),
+];
+
+/// Per-handler wall-clock bound in seconds for Mavis hook commands. Mavis
+/// accepts 1–10 (default 5) and bounds ordinary events by a shared 15s
+/// event budget, so 5s is both the default and a safe per-handler value.
+pub(crate) const MAVIS_HOOK_TIMEOUT_SECS: u64 = 5;
+
+/// `SessionEnd` gets a tighter bound: Mavis shares one 3s budget across
+/// *every* matching SessionEnd handler, ours and any third party's, so the
+/// declared timeout must fit well inside it.
+pub(crate) const MAVIS_SESSION_END_TIMEOUT_SECS: u64 = 3;
+
+/// Quote one argument for a POSIX shell (`sh`) command string.
+///
+/// Mavis runs `type: "command"` handlers through a shell, and the resolved
+/// `ai-memory` path and the token can both contain characters the shell would
+/// otherwise interpret, so every argument is single-quoted. Embedded single
+/// quotes close, escape, and reopen the quoted span.
+#[must_use]
+pub(crate) fn shell_quote_posix(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./:=@,+".contains(&b))
+    {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Quote one argument for a `cmd.exe` command string. Double quotes cover
+/// whitespace; an embedded double quote is escaped by doubling, which is
+/// `cmd.exe`'s only escape. Used for the `commandWindows` variant so the same
+/// generated plugin works on Windows, where no POSIX shell is assumed.
+#[must_use]
+pub(crate) fn shell_quote_windows(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    for ch in arg.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// The native-command argument vector shared by both platform spellings.
+fn mavis_hook_args(
+    our_event: &str,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(dir) = data_dir {
+        args.push("--data-dir".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    args.extend(
+        [
+            "hook",
+            "--event",
+            our_event,
+            "--agent",
+            "mavis",
+            "--server-url",
+            server_url,
+        ]
+        .map(String::from),
+    );
+    if let Some(token) = auth_token {
+        args.push("--auth-token".into());
+        args.push(token.to_string());
+    }
+    if let Some(strategy) = project_strategy {
+        args.push("--project-strategy".into());
+        args.push(strategy.to_string());
+    }
+    args
+}
+
+/// Whether a `type: "command"` string is an ai-memory Mavis hook.
+///
+/// Ownership has to be decidable from the handler alone, because the whole
+/// point of the uninstall path is removing *only* what `--apply` wrote. Mavis
+/// documents no `statusMessage`-style marker field for handlers, so the test
+/// keys on the unambiguous flag pair every command we generate carries:
+/// `--event <name>` followed by `--agent mavis`.
+#[must_use]
+pub(crate) fn is_our_mavis_hook_command(command: &str) -> bool {
+    // Require the binary, not just the flag pair: this predicate gates file
+    // DELETION, so a hand-added handler that merely mentions `--agent mavis`
+    // (a linter invocation, say) must not make the whole document ours.
+    // The shape mirrors the native-command test the uninstall path already
+    // uses for Kiro/Claude Code: an ai-memory binary, ` hook --event `, and
+    // the agent flag.
+    let lower = command.to_ascii_lowercase();
+    if !(lower.contains("ai-memory") || lower.contains("ai_memory")) {
+        return false;
+    }
+    if !lower.contains(" hook --event ") && !lower.contains("\"hook\" --event ") {
+        return false;
+    }
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--agent" {
+            return tokens.next() == Some("mavis");
+        }
+    }
+    false
+}
+
+/// Build the `hooks/hooks.json` document of the generated Mavis plugin.
+///
+/// Every entry is exec-form: a `type: "command"` string that runs ai-memory's
+/// native `hook` command directly, with the event JSON piped in on stdin.
+/// No script is staged and no shell is required at runtime, which is what
+/// keeps the native capture-policy enforcement path (a staged shell bundle
+/// cannot enforce it). Only the four documented handler fields are emitted —
+/// `type`, `command`, `commandWindows`, `timeout` — because Mavis documents
+/// no others and we must not invent keys.
+#[must_use]
+pub(crate) fn build_mavis_hooks_document(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "ai-memory".to_string());
+    let mut hooks = serde_json::Map::new();
+    for (mavis_event, our_event) in MAVIS_EVENTS {
+        let args = mavis_hook_args(
+            our_event,
+            server_url,
+            auth_token,
+            data_dir,
+            project_strategy,
+        );
+        let command = std::iter::once(&exe)
+            .chain(args.iter())
+            .map(|a| shell_quote_posix(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command_windows = std::iter::once(&exe)
+            .chain(args.iter())
+            .map(|a| shell_quote_windows(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let timeout = if mavis_event == "SessionEnd" {
+            MAVIS_SESSION_END_TIMEOUT_SECS
+        } else {
+            MAVIS_HOOK_TIMEOUT_SECS
+        };
+        hooks.insert(
+            mavis_event.to_string(),
+            serde_json::json!([{
+                "hooks": [{
+                    "type": "command",
+                    "command": command,
+                    "commandWindows": command_windows,
+                    "timeout": timeout,
+                }]
+            }]),
+        );
+    }
+    serde_json::json!({ "hooks": hooks })
+}
+
+/// Build the `.minimax-plugin/plugin.json` manifest of the generated plugin.
+///
+/// `apps` stays empty (the Desktop runtime ignores local App references) and
+/// `mcpServers`/`skills` stay empty because the MCP server is installed
+/// separately by `install-mcp --client mavis`, which owns the sibling-preserving
+/// merge into `~/.minimax/mcp.json`.
+#[must_use]
+pub(crate) fn build_mavis_plugin_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "name": "ai-memory-mavis",
+        "displayName": "ai-memory (MiniMax Code capture)",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Captures MiniMax Code (Mavis) lifecycle events into the local ai-memory server. Installed by `ai-memory install-hooks --agent mavis`.",
+        "author": "ai-memory",
+        "icon": "icon.png",
+        "category": "Productivity",
+        "exampleQueries": [
+            "Show what ai-memory captured in this session"
+        ],
+        "apps": [],
+        "mcpServers": [],
+        "skills": [],
+        "hooks": ["hooks/hooks.json"],
+    })
+}
+
 /// Devin hook payload for docker/setup-agent script snippets.
 /// Devin uses HookShape::Nested (same as Claude Code/Grok) but with
 /// DEVIN_EVENTS (PostCompaction instead of PreCompact, no subagent events).
@@ -2013,6 +2237,221 @@ mod tests {
     use std::process::Command;
     #[cfg(windows)]
     use std::process::Stdio;
+
+    // ---- Mavis plugin package ----
+
+    /// Unquote a POSIX single-quoted token the way a shell would, so a test
+    /// can assert on the *logical* argv rather than the quoting we emitted.
+    fn unquote_posix(token: &str) -> String {
+        if !token.starts_with('\'') {
+            return token.to_string();
+        }
+        let mut out = String::new();
+        let mut chars = token.chars();
+        chars.next();
+        while let Some(ch) = chars.next() {
+            if ch == '\'' {
+                // `'\''` — the shell closes, escapes a literal quote, reopens.
+                if chars.next() == Some('\\') && chars.next() == Some('\'') {
+                    out.push('\'');
+                    chars.next();
+                    continue;
+                }
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    fn mavis_handler<'a>(
+        document: &'a serde_json::Value,
+        event: &str,
+    ) -> &'a serde_json::Map<String, serde_json::Value> {
+        document["hooks"][event][0]["hooks"][0]
+            .as_object()
+            .unwrap_or_else(|| panic!("no handler generated for {event}"))
+    }
+
+    #[test]
+    fn mavis_hooks_document_covers_every_event_with_exec_form_commands() {
+        let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
+        let events = doc["hooks"].as_object().expect("hooks map");
+        assert_eq!(events.len(), MAVIS_EVENTS.len());
+        for (event, our_event) in MAVIS_EVENTS {
+            let groups = events
+                .get(event)
+                .unwrap_or_else(|| panic!("missing event {event}"))
+                .as_array()
+                .expect("matcher-group array");
+            assert_eq!(groups.len(), 1, "{event} should have one group");
+            // No matcher: every tool occurrence must be captured so the
+            // capture policy — not a name filter — decides what is kept.
+            assert!(
+                groups[0].get("matcher").is_none(),
+                "{event} must not filter by tool name"
+            );
+            let handler = mavis_handler(&doc, event);
+            assert_eq!(handler["type"], "command");
+            let command = handler["command"].as_str().expect("command string");
+            assert!(
+                command.contains(&format!("--event {our_event}")),
+                "{event} should invoke the {our_event} event: {command}"
+            );
+            assert!(command.contains("--agent mavis"), "{command}");
+            assert!(
+                command.contains("--server-url http://127.0.0.1:49374"),
+                "{command}"
+            );
+        }
+    }
+
+    /// The regression guard that would have caught a stray trailing argument
+    /// in the generated command: an extra positional makes every one of the
+    /// nine handlers exit 2 and silently kills capture. `HookArgs` declares
+    /// no positional argument, so the logical argv must contain `hook`
+    /// exactly once and nothing after the flags.
+    #[test]
+    fn mavis_generated_command_has_no_stray_positional_arguments() {
+        let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
+        for (event, _) in MAVIS_EVENTS {
+            let command = mavis_handler(&doc, event)["command"]
+                .as_str()
+                .expect("command string")
+                .to_string();
+            let argv: Vec<String> = command.split_whitespace().map(unquote_posix).collect();
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "hook").count(),
+                1,
+                "{event} must invoke `hook` exactly once: {command}"
+            );
+            // Everything after the leading binary must be a known flag or a
+            // flag's value — no bare positionals at all.
+            let known = [
+                "hook",
+                "--data-dir",
+                "--event",
+                "--agent",
+                "--server-url",
+                "--auth-token",
+                "--project-strategy",
+            ];
+            let mut expect_value = false;
+            for token in &argv[1..] {
+                if expect_value {
+                    expect_value = false;
+                    continue;
+                }
+                assert!(
+                    known.contains(&token.as_str()),
+                    "{event}: unexpected positional {token:?} in {command}"
+                );
+                expect_value = token.starts_with("--");
+            }
+            assert!(!expect_value, "{event}: dangling flag value in {command}");
+        }
+    }
+
+    /// The whole package must stay inside Mavis's documented handler schema.
+    /// Mavis documents only `type`, `command`, `commandWindows` and `timeout`,
+    /// so an extra key would be an invention the runtime may reject.
+    #[test]
+    fn mavis_hooks_document_uses_only_documented_handler_keys() {
+        let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
+        const ALLOWED: [&str; 4] = ["type", "command", "commandWindows", "timeout"];
+        for (event, _) in MAVIS_EVENTS {
+            let handler = mavis_handler(&doc, event);
+            for key in handler.keys() {
+                assert!(
+                    ALLOWED.contains(&key.as_str()),
+                    "{event} emits undocumented handler key {key}"
+                );
+            }
+            assert!(
+                handler.contains_key("commandWindows"),
+                "{event} needs Windows"
+            );
+            let timeout = handler["timeout"].as_u64().expect("timeout");
+            assert!((1..=10).contains(&timeout), "{event} timeout out of range");
+        }
+        // SessionEnd shares one 3s budget across all matching handlers.
+        assert_eq!(mavis_handler(&doc, "SessionEnd")["timeout"], 3);
+        assert_eq!(mavis_handler(&doc, "PreToolUse")["timeout"], 5);
+    }
+
+    #[test]
+    fn mavis_manifest_points_at_the_generated_hook_document() {
+        let manifest = build_mavis_plugin_manifest();
+        assert_eq!(manifest["schemaVersion"], 1);
+        assert_eq!(manifest["name"], "ai-memory-mavis");
+        assert_eq!(manifest["hooks"][0], "hooks/hooks.json");
+        assert!(manifest["apps"].as_array().is_some_and(|a| a.is_empty()));
+        assert!(
+            manifest["mcpServers"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+            "MCP is installed separately by install-mcp --client mavis"
+        );
+        assert!(
+            manifest["icon"]
+                .as_str()
+                .is_some_and(|i| i.ends_with(".png")),
+            "a valid icon file is required by the manifest"
+        );
+    }
+
+    #[test]
+    fn mavis_ownership_test_recognizes_generated_commands_and_rejects_foreign_ones() {
+        let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
+        for (event, _) in MAVIS_EVENTS {
+            let command = mavis_handler(&doc, event)["command"]
+                .as_str()
+                .expect("command string");
+            assert!(
+                is_our_mavis_hook_command(command),
+                "must recognize its own command for {event}: {command}"
+            );
+        }
+        // A data dir with spaces and a quote must not defeat the scan: the
+        // `--agent mavis` pair is always bare, adjacent tokens.
+        let awkward = build_mavis_hooks_document(
+            "http://127.0.0.1:49374",
+            Some("tok'en with spaces"),
+            Some(Path::new("/tmp/a dir/o'brien/ai-memory")),
+            None,
+        );
+        for (event, _) in MAVIS_EVENTS {
+            assert!(
+                is_our_mavis_hook_command(
+                    mavis_handler(&awkward, event)["command"].as_str().unwrap()
+                ),
+                "quoting broke ownership detection for {event}"
+            );
+        }
+        // The predicate gates DELETION, so a foreign command that merely
+        // mentions the flag pair must not be claimed.
+        for foreign in [
+            "my-linter run --agent mavis",
+            "/usr/local/bin/other hook --event session-start --agent mavis",
+            "ai-memory hook --event session-start --agent claude-code",
+            "ai-memory hook --agent mavis",
+        ] {
+            assert!(
+                !is_our_mavis_hook_command(foreign),
+                "must not claim a foreign command: {foreign}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_quoting_protects_special_characters() {
+        assert_eq!(shell_quote_posix("plain"), "plain");
+        assert_eq!(shell_quote_posix("has space"), "'has space'");
+        assert_eq!(shell_quote_posix("it's"), r#"'it'\''s'"#);
+        assert_eq!(shell_quote_posix(""), "''");
+        assert_eq!(shell_quote_windows("has space"), "\"has space\"");
+        assert_eq!(shell_quote_windows("a\"b"), "\"a\"\"b\"");
+    }
 
     fn decode_powershell_encoded_command(command: &str) -> String {
         let (_, encoded) = command

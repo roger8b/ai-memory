@@ -702,7 +702,59 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Hermes
             | AgentKind::Pool
             | AgentKind::Zcode
+            // Mavis posts Claude Code's `tool_name`/`tool_input`/`tool_use_id`
+            // trio on every tool event, so it belongs here for the same reason
+            // Grok does (#931): an agent present in
+            // `tool_observation_metadata` but absent here stores every tool
+            // observation with an empty title and body.
+            | AgentKind::Mavis
     )
+}
+
+/// Drift guard for the #931 class: an agent whose tool payload shape
+/// `tool_observation_metadata` recognizes must also be `closed_tool_agent`,
+/// or its tool observations are stored with an empty title and body. Grok and
+/// Mavis each shipped the half-migration, so assert the two lists agree
+/// rather than trusting a reviewer to remember both.
+#[cfg(test)]
+mod closed_tool_agent_drift {
+    use super::{AgentKind, closed_tool_agent};
+
+    /// The agents this crate's capture policy knows how to read a tool name
+    /// and id for, and which store a closed (metadata-only) tool body.
+    ///
+    /// `KiroCli` is deliberately absent from BOTH lists here: it does carry
+    /// tool metadata, but it is not in `closed_tool_agent` upstream, which is
+    /// a pre-existing divergence outside the scope of the Mavis work. It is
+    /// listed in neither the assertion below nor as a claimed pass, so
+    /// fixing Kiro's body handling is a separate, deliberate change rather
+    /// than something this branch smuggles in.
+    const AGENTS_WITH_TOOL_METADATA: &[AgentKind] = &[
+        AgentKind::ClaudeCode,
+        AgentKind::CommandCode,
+        AgentKind::Codex,
+        AgentKind::Grok,
+        AgentKind::Mavis,
+        AgentKind::OpenCode,
+        AgentKind::Pi,
+        AgentKind::Omp,
+        AgentKind::AntigravityCli,
+        AgentKind::Hermes,
+        AgentKind::Pool,
+        AgentKind::Zcode,
+    ];
+
+    #[test]
+    fn every_agent_with_tool_metadata_is_a_closed_tool_agent() {
+        for agent in AGENTS_WITH_TOOL_METADATA {
+            assert!(
+                closed_tool_agent(*agent),
+                "{agent:?} is read by tool_observation_metadata but is missing from \
+                 closed_tool_agent, so every one of its tool observations would be \
+                 stored with an empty title and body (#931)"
+            );
+        }
+    }
 }
 
 fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
@@ -2358,6 +2410,35 @@ mod tests {
         assert!(
             body.contains("MARKER_GROK_931"),
             "grok tool_response should be serialized into the body: {body:?}"
+        );
+    }
+
+    /// Regression guard for #931's twin on Mavis: an agent that
+    /// `tool_observation_metadata` recognizes but `closed_tool_agent` omits
+    /// stores every tool observation with an EMPTY body. Grok shipped with
+    /// that half-migration; this asserts Mavis did not.
+    #[test]
+    fn mavis_post_tool_excerpt_captures_tool_response() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("mavis".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "tool_name": "bash",
+                "tool_input": {"command": "ls"},
+                "tool_use_id": "call_mavis_1",
+                "tool_response": {"stdout": "MARKER_MAVIS"},
+            }),
+        );
+        let body = env
+            .body_excerpt
+            .expect("mavis post-tool body should not be empty");
+        assert!(
+            body.contains("MARKER_MAVIS"),
+            "mavis tool_response should be serialized into the body: {body:?}"
         );
     }
 

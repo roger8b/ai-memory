@@ -15,6 +15,10 @@
   ],
   "decisions": [
     {"agent":"claude-code","payload":{"tool_name":"Edit","tool_input":{"file_path":"secret/a"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"mavis","payload":{"tool_name":"Edit","tool_use_id":"call_abc123","tool_input":{"file_path":"secret/a"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"mavis","payload":{"tool_name":"read","tool_use_id":"call_def456","tool_input":{"path":"public/a"}},"disposition":"keep","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"mavis","payload":{"tool_name":"write","tool_use_id":"call_ghi789","tool_input":{"path":"secret/a","content":"x"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"mavis","payload":{"tool_name":"Edit"},"disposition":"metadata-only","tool_family":"file","extraction_state":"missing-or-malformed","path_count":0},
     {"agent":"codex","payload":{"tool_name":"Edit","tool_input":{"file_path":"secret/a"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
     {"agent":"cursor","payload":{"tool_name":"Edit","tool_input":{"file_path":"secret/a"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
     {"agent":"gemini-cli","payload":{"tool_name":"Edit","tool_input":{"file_path":"secret/a"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},

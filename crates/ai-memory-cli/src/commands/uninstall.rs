@@ -71,6 +71,8 @@ enum DeleteKind {
     OpenClawManifest,
     OpenClawEntrypoint,
     KiroCliV3Hooks,
+    MavisPluginManifest,
+    MavisPluginHooks,
     ManagedSkill,
 }
 
@@ -85,6 +87,8 @@ impl DeleteKind {
             Self::OpenClawManifest => "OpenClaw plugin manifest",
             Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
             Self::KiroCliV3Hooks => "Kiro CLI v3 hook file",
+            Self::MavisPluginManifest => "Mavis plugin manifest",
+            Self::MavisPluginHooks => "Mavis plugin hook document",
             Self::ManagedSkill => "managed Agent Skill",
         }
     }
@@ -254,6 +258,24 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             );
         }
 
+        // Mavis's hooks live in a package we generated, so uninstall is a
+        // whole-file delete rather than a config rewrite. Each file is proven
+        // ours independently at apply time, and the icon is deliberately left
+        // alone: it may be artwork the operator supplied.
+        let mavis_root = install_hooks::mavis_plugin_root()?;
+        for (relative, kind) in [
+            (
+                ".minimax-plugin/plugin.json",
+                DeleteKind::MavisPluginManifest,
+            ),
+            ("hooks/hooks.json", DeleteKind::MavisPluginHooks),
+        ] {
+            let path = mavis_root.join(relative);
+            if path.exists() {
+                push_generated_delete(&mut plan, path, kind);
+            }
+        }
+
         let antigravity = install_hooks::antigravity_hooks_path()?;
         if antigravity.exists() {
             let content = std::fs::read_to_string(&antigravity)
@@ -359,6 +381,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             CommandCode,
             Swival,
             Muse,
+            Mavis,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -1107,6 +1130,55 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
                                     .all(install_hooks::is_ai_memory_kiro_v3_hook_entry)
                         })
             }),
+        DeleteKind::MavisPluginManifest => serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .is_some_and(|v| {
+                // The manifest carries no free-form marker, so ownership is
+                // the plugin identity itself: our generated name, and a
+                // `hooks` array pointing at the document we also generated.
+                v.get("name").and_then(|name| name.as_str()) == Some("ai-memory-mavis")
+                    && v.get("schemaVersion").and_then(|v| v.as_u64()) == Some(1)
+                    && v.pointer("/hooks")
+                        .and_then(|hooks| hooks.as_array())
+                        .is_some_and(|hooks| {
+                            hooks.iter().all(|entry| entry.as_str() == Some("hooks/hooks.json"))
+                        })
+            }),
+        DeleteKind::MavisPluginHooks => serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|root| {
+                // Every event slot, and every handler in it, must be ours.
+                // A single foreign handler keeps the whole document, because
+                // deleting it would strip a plugin the user still uses.
+                root.len() == 1
+                    && root
+                        .get("hooks")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|events| {
+                            !events.is_empty()
+                                && events.values().all(|groups| {
+                                    groups.as_array().is_some_and(|groups| {
+                                        !groups.is_empty()
+                                            && groups.iter().all(|group| {
+                                                group
+                                                    .get("hooks")
+                                                    .and_then(|handlers| handlers.as_array())
+                                                    .is_some_and(|handlers| {
+                                                        !handlers.is_empty()
+                                                            && handlers.iter().all(|handler| {
+                                                                handler.get("command")
+                                                                    .and_then(|c| c.as_str())
+                                                                    .is_some_and(
+                                                                        install_hooks::is_our_mavis_hook_command,
+                                                                    )
+                                                            })
+                                                    })
+                                            })
+                                    })
+                                })
+                        })
+            }),
         DeleteKind::ManagedSkill => content.contains(MANAGED_MARKER),
     }
 }
@@ -1125,7 +1197,9 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::KiroCli
         | McpClient::CommandCode
         | McpClient::Swival
-        | McpClient::Devin => Some(&["mcpServers"]),
+        | McpClient::Devin
+        // Mavis's mcp.json is a root `mcpServers` map, the same spelling.
+        | McpClient::Mavis => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::OpenCode2 => Some(&["mcp", "servers"]),
         McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),

@@ -88,6 +88,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
         McpClient::Muse => render_muse(&args)?,
+        McpClient::Mavis => render_mavis(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -225,6 +226,10 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // (workspace scopes like .zcode/config.json exist, but user scope
         // is the install default for every other client too).
         McpClient::Zcode => home()?.join(".zcode").join("cli").join("config.json"),
+        // Mavis keeps its agent data dir at $MINIMAX_DATA_DIR when set,
+        // falling back to ~/.minimax — the same override the hook installer
+        // honours, so both halves land in one profile.
+        McpClient::Mavis => mavis_data_dir()?.join("mcp.json"),
         McpClient::Devin => home()?.join(".devin").join("config.json"),
         // Kimi Code keeps its data dir at $KIMI_CODE_HOME when set,
         // falling back to ~/.kimi-code; MCP servers live in mcp.json at
@@ -553,7 +558,9 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
-        | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::Swival
+        // Mavis's mcp.json is a plain `mcpServers` map at the document root.
+        | McpClient::Mavis => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
         // Zero, and ZCode use.
@@ -579,6 +586,7 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::Zero => build_mcp_entry_zero(args),
         McpClient::Zcode => build_mcp_entry_zcode(args),
         McpClient::Muse => build_mcp_entry_muse(args),
+        McpClient::Mavis => build_mcp_entry_mavis(args),
         McpClient::Codex | McpClient::Grok => {
             bail!("internal: Codex/Grok MCP config is TOML, not JSON")
         }
@@ -1341,6 +1349,63 @@ fn render_pi(args: &InstallMcpArgs) -> Result<String> {
     Ok(pi_mcp_render_guidance(args))
 }
 
+/// MiniMax Code (Mavis) agent data dir: `$MINIMAX_DATA_DIR` when set,
+/// otherwise `~/.minimax`. The override is read here rather than duplicated
+/// in the hook installer so both halves of the integration resolve one
+/// profile — a hook package written to a different dir than the MCP config
+/// would leave capture running with no memory tools.
+pub(crate) fn mavis_data_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("MINIMAX_DATA_DIR").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(home_dir()
+        .context(
+            "could not locate $HOME for ~/.minimax/mcp.json; set MINIMAX_DATA_DIR to override",
+        )?
+        .join(".minimax"))
+}
+
+/// MiniMax Code (Mavis) MCP entry: `type: "http"` + `url` + optional
+/// `headers`, plus `enabled` and a human-readable `description`.
+///
+/// Mavis's own bookkeeping keys are deliberately absent. A runtime-written
+/// entry carries `configured` and `builtin`, but those describe state Mavis
+/// derives by probing the server; writing them ourselves would assert a probe
+/// result we never performed. Leaving them out lets the runtime set them on
+/// first connect, which is the honest value.
+fn build_mcp_entry_mavis(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let bearer = bearer_header_value(args.auth_token.as_deref());
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("http"));
+    entry.insert("url".into(), json!(server_url));
+    if let Some(b) = bearer {
+        entry.insert("headers".into(), json!({"Authorization": b}));
+    }
+    entry.insert("enabled".into(), json!(true));
+    entry.insert(
+        "description".into(),
+        json!("ai-memory: long-term memory, handoffs, and session recall"),
+    );
+    Ok(serde_json::Value::Object(entry))
+}
+
+fn render_mavis(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# MiniMax Code (Mavis) — merge into ~/.minimax/mcp.json\n\
+         # (or re-run this command with --apply), then start a new session.\n\
+         #\n\
+         # The `configured` and `builtin` keys a runtime-written entry carries\n\
+         # are intentionally not written here: they record a probe this command\n\
+         # never performed, and Mavis sets them itself on first connect.\n\
+         #\n\
+         # Lifecycle capture is installed separately, and is not MCP:\n\
+         #   ai-memory install-hooks --agent mavis --apply\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn pi_mcp_render_guidance(args: &InstallMcpArgs) -> String {
     format!(
         "# Pi has no native mcp.json. Do not write ~/.pi/agent/mcp.json.\n\
@@ -1998,6 +2063,7 @@ mod tests {
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
+            McpClient::Mavis => render_mavis(&args).unwrap(),
         }
     }
 
@@ -2105,6 +2171,7 @@ mod tests {
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
+            McpClient::Mavis => render_mavis(&args).unwrap(),
         }
     }
 

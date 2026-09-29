@@ -1173,6 +1173,52 @@ ai-memory finalize-session --agent zcode --session-id <uuid>
 No first-party `install-mcp` client and no managed workstream
 (`ai-memory run zcode`) are claimed yet.
 
+### MiniMax Code (Mavis)
+
+Mavis (wire `mavis`, aliases `minimax`, `minimax-code`, `mcode`) is the one
+agent whose hook surface is a **package** rather than a settings file, so
+`install-hooks` writes a directory tree instead of merging keys into a
+document. Both halves resolve the agent data dir the same way:
+`$MINIMAX_DATA_DIR` when set, otherwise `~/.minimax`.
+
+```bash
+ai-memory install-hooks --agent mavis --apply     # hook capture
+ai-memory install-mcp   --client mavis --apply    # MCP tools
+```
+
+`--apply` creates `<data-dir>/plugins/ai-memory-mavis/`:
+
+```text
+.minimax-plugin/plugin.json   # manifest: schemaVersion, name, icon, hooks[]
+hooks/hooks.json              # one exec-form handler per event
+icon.png                      # written only when absent — yours is kept
+```
+
+Every entry is a `type: "command"` string that runs the native command
+directly, so **no script is staged and no shell is required** — which is what
+keeps the native capture-policy enforcement path (a staged shell bundle cannot
+enforce it) and makes the same package work on Windows via the emitted
+`commandWindows` variant. Nine events are installed: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop`,
+`SessionEnd`, `SubagentStart`, `SubagentStop`. The tool events deliberately
+carry **no `matcher`**, so every tool occurrence is captured and the capture
+policy — not a name filter — decides what is kept.
+
+`SessionStart` injects `hookSpecificOutput.additionalContext` as model
+context, so the prior session's handoff is delivered automatically.
+
+Inspect the exact files without writing anything:
+
+```bash
+ai-memory install-hooks --agent mavis
+```
+
+Mavis rescans local plugins automatically; no restart is required. Uninstall
+removes the generated manifest and hook document — each proven ours from its
+own contents — while preserving `icon.png` and every sibling plugin.
+
+No managed workstream (`ai-memory run mavis`) is claimed yet.
+
 ### OpenCode
 
 ```bash

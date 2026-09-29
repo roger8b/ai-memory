@@ -84,6 +84,10 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         emit_zcode(&args)?;
         return Ok(());
     }
+    if matches!(args.agent, AgentChoice::Mavis) {
+        emit_mavis(&args)?;
+        return Ok(());
+    }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
         bail!("internal: generated integration should have returned before staging hooks")
     };
@@ -176,7 +180,8 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Omp
         | AgentChoice::Openclaw
         | AgentChoice::Zero
-        | AgentChoice::Zcode => {
+        | AgentChoice::Zcode
+        | AgentChoice::Mavis => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
@@ -242,6 +247,48 @@ fn emit_zcode(args: &SetupAgentArgs) -> Result<()> {
     println!("#       sessions with `ai-memory finalize-session --agent zcode`.");
     println!();
     println!("{serialized}");
+    Ok(())
+}
+
+/// Mavis's hook surface is a Plugin V1 *package*, so there is no single file
+/// to merge: setup-agent prints the two JSON documents that make up the
+/// package and tells the operator where to put them. Prefer
+/// `ai-memory install-hooks --agent mavis --apply`, which writes the tree
+/// (and the icon) correctly for you.
+fn emit_mavis(args: &SetupAgentArgs) -> Result<()> {
+    let manifest = crate::commands::render_shared::build_mavis_plugin_manifest();
+    let hooks = crate::commands::render_shared::build_mavis_hooks_document(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    println!("# MiniMax Code (Mavis) — create a Plugin V1 package under");
+    println!("# <data-dir>/plugins/ai-memory-mavis/ (default ~/.minimax), with:");
+    println!("#   .minimax-plugin/plugin.json");
+    println!("#   hooks/hooks.json");
+    println!("#   icon.png            (a valid PNG is required by the manifest)");
+    println!("# The `command` in each handler must be an ai-memory binary reachable");
+    println!("# on the host that runs Mavis; prefer");
+    println!("# `ai-memory install-hooks --agent mavis --apply` from that host so");
+    println!("# the path is resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat the package as sensitive.");
+    }
+    println!("# NOTE: Mavis injects SessionStart stdout as model context, so the");
+    println!("#       prior session's handoff is delivered automatically.");
+    println!();
+    println!("# --- .minimax-plugin/plugin.json ---");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&manifest).context("serializing mavis plugin manifest")?
+    );
+    println!();
+    println!("# --- hooks/hooks.json ---");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&hooks).context("serializing mavis hooks document")?
+    );
     Ok(())
 }
 

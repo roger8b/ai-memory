@@ -5012,6 +5012,10 @@ impl AiMemoryServer {
                 "devin": "AGENTS.md",
                 "kimi_code": "AGENTS.md",
                 "command_code": "AGENTS.md",
+                // MiniMax Code (Mavis) is AGENTS.md-based; it also reads the
+                // cross-vendor `.agents/skills` root, so no skill-root entry
+                // is needed in `target_hints` below.
+                "mavis": "AGENTS.md",
                 "grok": "AGENTS.md",
                 "default": "AGENTS.md"
             },

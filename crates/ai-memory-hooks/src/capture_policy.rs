@@ -171,10 +171,14 @@ pub(crate) fn tool_observation_metadata(
         // Grok Build CLI posts Claude Code's snake_case aliases
         // (`tool_name` / `tool_input` / `tool_use_id`) on its tool hooks
         // alongside camelCase, so it shares this mapping (#931).
+        // MiniMax Code (Mavis) posts exactly these snake_case fields —
+        // live-captured 2026-09-29 across 37 `PreToolUse` and 35
+        // `PostToolUse` events, `tool_use_id` in `call_…` form.
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
         | AgentKind::Grok
+        | AgentKind::Mavis
         | AgentKind::Zcode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
@@ -223,6 +227,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Grok
                             | AgentKind::Hermes
                             | AgentKind::KiroCli
+                            | AgentKind::Mavis
                             | AgentKind::Pool
                             | AgentKind::Zcode
                     ) {
@@ -280,6 +285,11 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Codex PostToolUse also fires for failed commands. Its native exec
         // response is output text, with no separate success/exit-code field;
         // neither the event nor arbitrary response JSON proves an outcome.
+        //
+        // MiniMax Code (Mavis) is deliberately absent for the same reason: its
+        // `PostToolUse` payload shape for failures has not been live-captured,
+        // and mapping an unproven field would violate the rule that an outcome
+        // is recorded only where the adapter protocol proves its meaning.
         _ => ToolOutcome::Unknown,
     }
 }
@@ -706,7 +716,9 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::KiroCli
         | AgentKind::Pool
         // ZCode mirrors Claude Code's snake_case `tool_name`/`tool_input`
-        // aliases on every tool event (live-captured, #512).
+        // aliases on every tool event (live-captured, #512). MiniMax Code
+        // (Mavis) posts the same pair (live-captured 2026-09-29).
+        | AgentKind::Mavis
         | AgentKind::Zcode => object
             .get("tool_name")
             .and_then(Value::as_str)

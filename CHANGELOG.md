@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- MiniMax Code (Mavis) is now a supported capture agent (wire `mavis`, aliases
+  `minimax`, `minimax-code`, `mcode`). `install-hooks --agent mavis --apply`
+  writes a MiniMax Plugin V1 package under `<data-dir>/plugins/ai-memory-mavis/`
+  (default `~/.minimax`; override with `MINIMAX_DATA_DIR`), and
+  `install-mcp --client mavis --apply` registers the MCP server in
+  `<data-dir>/mcp.json`. Mavis's hook surface is a *package* rather than a
+  settings file, so the installer creates a directory tree — the first agent
+  integrated that way. Each hook entry is an exec-form `type: "command"`
+  running the native `ai-memory hook` command, with a `commandWindows`
+  sibling, so no script is staged, no shell is required, and the native
+  capture-policy enforcement path is preserved (a staged shell bundle cannot
+  enforce capture-policy capability v1). Nine events are installed:
+  `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+  `PreCompact`, `Stop`, `SessionEnd`, `SubagentStart`, `SubagentStop`. Mavis
+  injects `SessionStart` stdout as model context via
+  `hookSpecificOutput.additionalContext`, so handoff delivery works.
+  `PermissionRequest` and `PostCompact` are deliberately not installed —
+  the former races the interactive permission client, the latter has no
+  ai-memory event. Mavis tool payloads were verified live to carry Claude
+  Code's `tool_name` / `tool_input` / `tool_use_id`, and `SessionStart` /
+  `UserPromptSubmit` context injection is documented for the runtime.
+  `PostToolUse` outcome mapping is deliberately left as unknown: Mavis's
+  failure payload shape was not live-captured, and an outcome is only
+  recorded where the adapter protocol proves its meaning. Uninstall removes
+  the generated manifest and hook document (proved ours from their contents)
+  while preserving `icon.png` and all sibling plugins. No managed workstream
+  (`ai-memory run mavis`) is claimed.
+
 - `docs/llm-providers.md` now has a dedicated OpenRouter subsection and a
   matching row in the recommended-defaults table. The wiring
   (`openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1`)
