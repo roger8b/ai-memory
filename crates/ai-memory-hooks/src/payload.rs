@@ -755,6 +755,24 @@ mod closed_tool_agent_drift {
             );
         }
     }
+
+    /// Kiro CLI is a KNOWN, NOT-YET-FIXED instance of #931: its tool payloads
+    /// yield metadata, but it is absent from `closed_tool_agent`, so its tool
+    /// observations are stored with an empty title and body.
+    ///
+    /// This is `#[ignore]`d rather than quietly omitted on purpose. Writing a
+    /// guard that skips a known-failing agent certifies a broken behaviour as
+    /// correct; this way the failure is recorded, discoverable with
+    /// `--ignored`, and flips to a normal failure the moment someone fixes
+    /// Kiro without updating this list.
+    #[test]
+    #[ignore = "KiroCli has tool metadata but is not a closed tool agent (#931); fix in a dedicated change"]
+    fn kiro_cli_needs_the_same_closed_tool_agent_treatment() {
+        assert!(
+            closed_tool_agent(AgentKind::KiroCli),
+            "KiroCli tool observations still store an empty title and body (#931)"
+        );
+    }
 }
 
 fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {

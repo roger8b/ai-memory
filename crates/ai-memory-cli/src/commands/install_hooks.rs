@@ -231,9 +231,15 @@ pub(crate) use super::render_shared::is_our_mavis_hook_command;
 ///
 /// Mavis has no user-scope hooks file: its lifecycle surface is a *package*
 /// under the agent data dir's `plugins/` tree, so this is a directory we own
-/// rather than a JSON document we merge into. `MINIMAX_DATA_DIR` overrides the
-/// default the same way `KIRO_HOME` / `GROK_HOME` do for those agents, so a
-/// non-default profile installs into the right tree.
+/// rather than a JSON document we merge into.
+///
+/// `MINIMAX_DATA_DIR` is an opt-in escape hatch, NOT a verified property of
+/// the runtime — unlike `KIRO_HOME`, which was confirmed against Kiro CLI
+/// 2.16.2. Mavis's own data dir is resolved by its runtime, and no public
+/// documentation of an override was found. The default (`~/.minimax`) is the
+/// observed real path; if the variable name is wrong the override is
+/// silently ignored and install lands in the default profile, which is
+/// harmless. Set it only when relocating a profile deliberately.
 pub(crate) fn mavis_plugin_root() -> anyhow::Result<std::path::PathBuf> {
     // Resolved through the *same* helper `install-mcp --client mavis` uses, so
     // the hook package and the MCP config can never land in different
@@ -5721,7 +5727,10 @@ fn apply_to_mavis_plugin(
     write_generated_json(&hooks_dir.join("hooks.json"), &hooks_doc)?;
 
     // Only seed the placeholder icon when none exists, so an operator-supplied
-    // icon survives every re-apply.
+    // icon survives every re-apply. A plain write is correct here and
+    // deliberately not routed through `apply_atomic`: this file is created
+    // once and never mutated in place, there is no prior content to back up,
+    // and a binary blob is not a document to diff.
     let icon = root.join("icon.png");
     if !icon.exists() {
         std::fs::write(&icon, MAVIS_ICON_PNG)

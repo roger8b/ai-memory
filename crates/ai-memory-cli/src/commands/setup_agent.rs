@@ -85,7 +85,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         return Ok(());
     }
     if matches!(args.agent, AgentChoice::Mavis) {
-        emit_mavis(&args)?;
+        emit_mavis(&args, &config.data_dir)?;
         return Ok(());
     }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
@@ -255,12 +255,16 @@ fn emit_zcode(args: &SetupAgentArgs) -> Result<()> {
 /// package and tells the operator where to put them. Prefer
 /// `ai-memory install-hooks --agent mavis --apply`, which writes the tree
 /// (and the icon) correctly for you.
-fn emit_mavis(args: &SetupAgentArgs) -> Result<()> {
+fn emit_mavis(args: &SetupAgentArgs, data_dir: &Path) -> Result<()> {
     let manifest = crate::commands::render_shared::build_mavis_plugin_manifest();
     let hooks = crate::commands::render_shared::build_mavis_hooks_document(
         &args.server_url,
         args.auth_token.as_deref(),
-        None,
+        // Bake the data dir, exactly as `install-hooks --apply` does. Passing
+        // None would print commands that resolve the dir from the ambient
+        // environment instead of the configured one, so the two surfaces
+        // would silently disagree.
+        Some(data_dir),
         None,
     );
     println!("# MiniMax Code (Mavis) — create a Plugin V1 package under");

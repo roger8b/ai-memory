@@ -606,8 +606,15 @@ pub(crate) const MAVIS_EVENTS: [(&str, &str); 9] = [
 
 /// Per-handler wall-clock bound in seconds for Mavis hook commands. Mavis
 /// accepts 1–10 (default 5) and bounds ordinary events by a shared 15s
-/// event budget, so 5s is both the default and a safe per-handler value.
-pub(crate) const MAVIS_HOOK_TIMEOUT_SECS: u64 = 5;
+/// event budget.
+///
+/// The worst case this must cover is `session-start`, which does two
+/// sequential blocking steps: draining the spool (3s) and then the handoff
+/// fetch (3s) — about 6s, which the 5s default would cut short. The fetch is
+/// DESTRUCTIVE server-side, so being killed mid-flight consumes the handoff
+/// without ever delivering it, silently. Hence 10, Mavis's documented
+/// maximum; the sibling doing identical work uses the same reasoning.
+pub(crate) const MAVIS_HOOK_TIMEOUT_SECS: u64 = 10;
 
 /// `SessionEnd` gets a tighter bound: Mavis shares one 3s budget across
 /// *every* matching SessionEnd handler, ours and any third party's, so the
@@ -708,34 +715,41 @@ pub(crate) fn is_our_mavis_hook_command(command: &str) -> bool {
     // Require the binary, not just the flag pair: this predicate gates file
     // DELETION, so a hand-added handler that merely mentions `--agent mavis`
     // (a linter invocation, say) must not make the whole document ours.
-    // The shape mirrors the native-command test the uninstall path already
-    // uses for Kiro/Claude Code: an ai-memory binary, ` hook --event `, and
-    // the agent flag.
     let lower = command.to_ascii_lowercase();
     if !(lower.contains("ai-memory") || lower.contains("ai_memory")) {
         return false;
     }
-    if !lower.contains(" hook --event ") && !lower.contains("\"hook\" --event ") {
-        return false;
-    }
-    let mut tokens = command.split_whitespace();
-    while let Some(token) = tokens.next() {
-        if token == "--agent" {
-            return tokens.next() == Some("mavis");
-        }
-    }
-    false
+    // Tokenize and strip shell quoting so the shape is recognised in BOTH
+    // platform spellings we emit. The POSIX form quotes only what needs it
+    // (`… hook --event …`), while the `commandWindows` form quotes every
+    // argument (`… "hook" "--event" …`); matching on raw substrings would
+    // silently fail on the latter and make the uninstall path treat our own
+    // Windows command as foreign.
+    let tokens: Vec<String> = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(|c| c == '\'' || c == '"').to_string())
+        .collect();
+    tokens
+        .windows(2)
+        .any(|pair| pair[0] == "hook" && pair[1] == "--event")
+        && tokens
+            .windows(2)
+            .any(|pair| pair[0] == "--agent" && pair[1] == "mavis")
 }
 
 /// Build the `hooks/hooks.json` document of the generated Mavis plugin.
 ///
-/// Every entry is exec-form: a `type: "command"` string that runs ai-memory's
-/// native `hook` command directly, with the event JSON piped in on stdin.
-/// No script is staged and no shell is required at runtime, which is what
-/// keeps the native capture-policy enforcement path (a staged shell bundle
-/// cannot enforce it). Only the four documented handler fields are emitted —
-/// `type`, `command`, `commandWindows`, `timeout` — because Mavis documents
-/// no others and we must not invent keys.
+/// Every entry invokes ai-memory's native `hook` command directly rather than
+/// staging a shell script: the native path is what enforces capture-policy
+/// capability v1, which a staged bundle cannot. Note the command is a
+/// `type: "command"` STRING, which Mavis runs through the host shell (its own
+/// plugin examples rely on `${PLUGIN_ROOT}` expansion), so arguments are
+/// quoted per platform — single quotes for POSIX, a `commandWindows` twin
+/// using `cmd.exe` quoting for Windows.
+///
+/// Only the four documented handler fields are emitted — `type`, `command`,
+/// `commandWindows`, `timeout` — because Mavis documents no others and we
+/// must not invent keys.
 #[must_use]
 pub(crate) fn build_mavis_hooks_document(
     server_url: &str,
@@ -2376,7 +2390,23 @@ mod tests {
         }
         // SessionEnd shares one 3s budget across all matching handlers.
         assert_eq!(mavis_handler(&doc, "SessionEnd")["timeout"], 3);
-        assert_eq!(mavis_handler(&doc, "PreToolUse")["timeout"], 5);
+        // The rest must clear session-start's worst case (3s drain + 3s
+        // handoff fetch). Under it, Mavis could kill the handler mid-fetch
+        // and silently consume the handoff without delivering it.
+        assert_eq!(mavis_handler(&doc, "PreToolUse")["timeout"], 10);
+        assert_eq!(mavis_handler(&doc, "SessionStart")["timeout"], 10);
+        // Read the value back off the generated document rather than
+        // re-asserting the constant, so this actually ties the emitted
+        // timeout to the documented budget reasoning.
+        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"] {
+            let timeout = mavis_handler(&doc, event)["timeout"]
+                .as_u64()
+                .expect("timeout");
+            assert!(
+                timeout > 6,
+                "{event}: {timeout}s does not clear the 3s drain + 3s handoff worst case"
+            );
+        }
     }
 
     #[test]
@@ -2404,13 +2434,16 @@ mod tests {
     fn mavis_ownership_test_recognizes_generated_commands_and_rejects_foreign_ones() {
         let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
         for (event, _) in MAVIS_EVENTS {
-            let command = mavis_handler(&doc, event)["command"]
-                .as_str()
-                .expect("command string");
-            assert!(
-                is_our_mavis_hook_command(command),
-                "must recognize its own command for {event}: {command}"
-            );
+            let handler = mavis_handler(&doc, event);
+            // BOTH spellings, because the uninstall path requires both to
+            // call the document ours.
+            for field in ["command", "commandWindows"] {
+                let command = handler[field].as_str().expect(field);
+                assert!(
+                    is_our_mavis_hook_command(command),
+                    "must recognize its own {field} for {event}: {command}"
+                );
+            }
         }
         // A data dir with spaces and a quote must not defeat the scan: the
         // `--agent mavis` pair is always bare, adjacent tokens.
@@ -2421,12 +2454,14 @@ mod tests {
             None,
         );
         for (event, _) in MAVIS_EVENTS {
-            assert!(
-                is_our_mavis_hook_command(
-                    mavis_handler(&awkward, event)["command"].as_str().unwrap()
-                ),
-                "quoting broke ownership detection for {event}"
-            );
+            for field in ["command", "commandWindows"] {
+                assert!(
+                    is_our_mavis_hook_command(
+                        mavis_handler(&awkward, event)[field].as_str().unwrap()
+                    ),
+                    "quoting broke ownership detection for {event}/{field}"
+                );
+            }
         }
         // The predicate gates DELETION, so a foreign command that merely
         // mentions the flag pair must not be claimed.

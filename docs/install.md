@@ -1194,15 +1194,21 @@ hooks/hooks.json              # one exec-form handler per event
 icon.png                      # written only when absent — yours is kept
 ```
 
-Every entry is a `type: "command"` string that runs the native command
-directly, so **no script is staged and no shell is required** — which is what
-keeps the native capture-policy enforcement path (a staged shell bundle cannot
-enforce it) and makes the same package work on Windows via the emitted
-`commandWindows` variant. Nine events are installed: `SessionStart`,
-`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop`,
-`SessionEnd`, `SubagentStart`, `SubagentStop`. The tool events deliberately
-carry **no `matcher`**, so every tool occurrence is captured and the capture
-policy — not a name filter — decides what is kept.
+Every entry is a `type: "command"` string that invokes the native command
+directly, so **no script is staged** — which is what keeps the native
+capture-policy enforcement path (a staged shell bundle cannot enforce it).
+Mavis runs `command` through the host shell, so arguments are quoted per
+platform and a `commandWindows` sibling using `cmd.exe` quoting is emitted
+alongside each one; the same package therefore works on Windows. Nine events
+are installed: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`, `PreCompact`, `Stop`, `SessionEnd`, `SubagentStart`,
+`SubagentStop`. The tool events deliberately carry **no `matcher`**, so every
+tool occurrence is captured and the capture policy — not a name filter —
+decides what is kept. Handler timeouts are 10s — above `session-start`'s worst
+case of a 3s spool drain plus a 3s handoff fetch, which is destructive
+server-side, so a kill mid-fetch would consume a handoff without delivering
+it — and 3s for `SessionEnd`, which shares one budget across every matching
+handler.
 
 `SessionStart` injects `hookSpecificOutput.additionalContext` as model
 context, so the prior session's handoff is delivered automatically.

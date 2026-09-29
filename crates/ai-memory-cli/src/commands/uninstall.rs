@@ -46,6 +46,9 @@ enum RewriteOp {
     KiroCliV2HooksJson,
     /// Kiro CLI v3 standalone hooks with exact generated names and commands.
     KiroCliV3HooksJson,
+    /// Mavis plugin `hooks/hooks.json`, when it also holds foreign handlers
+    /// and so must be rewritten rather than deleted whole.
+    MavisPluginHooksJson,
     /// MCP JSON config for one client shape.
     McpJson(McpClient),
     /// Codex TOML MCP config.
@@ -258,21 +261,32 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             );
         }
 
-        // Mavis's hooks live in a package we generated, so uninstall is a
-        // whole-file delete rather than a config rewrite. Each file is proven
-        // ours independently at apply time, and the icon is deliberately left
-        // alone: it may be artwork the operator supplied.
+        // Mavis's hooks live in a package we generated, so uninstall is
+        // normally a whole-file delete. The exception is a document the
+        // operator hand-edited: then it must be REWRITTEN (our handlers
+        // withdrawn, theirs kept) rather than deleted, because deleting it
+        // would destroy their hook while keeping it would leave a dangling
+        // ai-memory command pointing at a server that is going away. The
+        // icon is left alone in both cases — it may be operator artwork.
         let mavis_root = install_hooks::mavis_plugin_root()?;
-        for (relative, kind) in [
-            (
-                ".minimax-plugin/plugin.json",
-                DeleteKind::MavisPluginManifest,
-            ),
-            ("hooks/hooks.json", DeleteKind::MavisPluginHooks),
-        ] {
-            let path = mavis_root.join(relative);
-            if path.exists() {
-                push_generated_delete(&mut plan, path, kind);
+        let mavis_manifest = mavis_root.join(".minimax-plugin").join("plugin.json");
+        if mavis_manifest.exists() {
+            push_generated_delete(&mut plan, mavis_manifest, DeleteKind::MavisPluginManifest);
+        }
+        let mavis_hooks = mavis_root.join("hooks").join("hooks.json");
+        if mavis_hooks.exists() {
+            if generated_file_is_ours(&mavis_hooks, DeleteKind::MavisPluginHooks) {
+                push_generated_delete(&mut plan, mavis_hooks, DeleteKind::MavisPluginHooks);
+            } else {
+                let content = std::fs::read_to_string(&mavis_hooks)
+                    .with_context(|| format!("reading {}", mavis_hooks.display()))?;
+                let removal = strip_mavis_hooks(&content)?;
+                push_rewrite(
+                    &mut plan,
+                    mavis_hooks,
+                    removal.removed_events,
+                    RewriteOp::MavisPluginHooksJson,
+                );
             }
         }
 
@@ -569,6 +583,7 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
                         RewriteOp::KimiCodeHooksToml => strip_kimi_code_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV2HooksJson => strip_kiro_cli_v2_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV3HooksJson => strip_kiro_cli_v3_hooks(&out)?.new_content,
+                        RewriteOp::MavisPluginHooksJson => strip_mavis_hooks(&out)?.new_content,
                         RewriteOp::McpJson(client) => {
                             strip_mcp_json_client(&out, client, name, url)?.0
                         }
@@ -840,6 +855,69 @@ fn strip_hook_events(
             hooks.remove(&event);
         }
     }
+}
+
+/// Remove ai-memory's entries from the generated Mavis plugin hook document.
+///
+/// The plugin package is ours, but a user may still have added their own
+/// handler to `hooks/hooks.json` (a linter, a formatter). Deleting the whole
+/// file in that case would destroy their hook, and *keeping* it wholesale
+/// would leave a dangling ai-memory command POSTing to a server the user just
+/// removed. So this withdraws only our handlers, keeps foreign ones, prunes
+/// matcher groups and event keys we emptied, and leaves an empty `hooks`
+/// object out of the result.
+///
+/// `DeleteKind::MavisPluginHooks` handles the simpler case where every
+/// handler is ours: there the whole file is deleted rather than rewritten,
+/// so an untouched install leaves nothing behind.
+fn strip_mavis_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+            return Ok(());
+        };
+        let events: Vec<String> = hooks.keys().cloned().collect();
+        for event in events {
+            let Some(groups) = hooks.get_mut(&event).and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            let mut removed_from_event = false;
+            groups.retain_mut(|group| {
+                let Some(handlers) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                    return true;
+                };
+                let before = handlers.len();
+                handlers.retain(|handler| {
+                    // Withdraw a handler only when BOTH spellings are ours,
+                    // mirroring the ownership rule. A handler the operator
+                    // edited on either platform is theirs to keep.
+                    let ours = |field: &str| {
+                        handler
+                            .get(field)
+                            .and_then(|c| c.as_str())
+                            .is_some_and(install_hooks::is_our_mavis_hook_command)
+                    };
+                    !(ours("command") && ours("commandWindows"))
+                });
+                removed_from_event |= handlers.len() != before;
+                !handlers.is_empty()
+            });
+            if removed_from_event {
+                removed_events.push(event.clone());
+            }
+            if groups.is_empty() {
+                hooks.remove(&event);
+            }
+        }
+        if hooks.is_empty() {
+            root.remove("hooks");
+        }
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
 }
 
 /// Remove ai-memory hook entries from a settings/hooks JSON document.
@@ -1167,11 +1245,27 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
                                                     .is_some_and(|handlers| {
                                                         !handlers.is_empty()
                                                             && handlers.iter().all(|handler| {
-                                                                handler.get("command")
+                                                                // BOTH platform spellings
+                                                                // must be ours. On Windows
+                                                                // the operator edits
+                                                                // `commandWindows` — the
+                                                                // string their shell actually
+                                                                // runs — so checking only
+                                                                // `command` would let a
+                                                                // hand-edited Windows handler
+                                                                // be deleted with the file.
+                                                                handler
+                                                                    .get("command")
                                                                     .and_then(|c| c.as_str())
                                                                     .is_some_and(
                                                                         install_hooks::is_our_mavis_hook_command,
                                                                     )
+                                                                    && handler
+                                                                        .get("commandWindows")
+                                                                        .and_then(|c| c.as_str())
+                                                                        .is_some_and(
+                                                                            install_hooks::is_our_mavis_hook_command,
+                                                                        )
                                                             })
                                                     })
                                             })

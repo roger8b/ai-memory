@@ -158,8 +158,8 @@ command form.
 Use the matching `--client` / `--agent` values for other clients, for
 example `codex`, `command-code`, `devin`, `kimi-code`, `kiro-cli`, `cursor`, or `gemini-cli`.
 `mavis` (MiniMax Code) needs no special Windows handling: its generated plugin
-package emits a `commandWindows` sibling for every hook command, so the same
-package runs natively on Windows with no shell and no staged script.
+package emits a `commandWindows` sibling for every hook command, quoted for
+`cmd.exe`, so the same package runs on Windows with no staged script.
 
 For Devin, `install-mcp --client devin --apply` writes MCP config to
 `%USERPROFILE%\.devin\config.json`. `install-hooks --agent devin --apply`

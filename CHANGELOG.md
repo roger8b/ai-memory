@@ -15,11 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `install-mcp --client mavis --apply` registers the MCP server in
   `<data-dir>/mcp.json`. Mavis's hook surface is a *package* rather than a
   settings file, so the installer creates a directory tree — the first agent
-  integrated that way. Each hook entry is an exec-form `type: "command"`
-  running the native `ai-memory hook` command, with a `commandWindows`
-  sibling, so no script is staged, no shell is required, and the native
-  capture-policy enforcement path is preserved (a staged shell bundle cannot
-  enforce capture-policy capability v1). Nine events are installed:
+  integrated that way. Each hook entry is a `type: "command"` string invoking
+  the native `ai-memory hook` command, with a `commandWindows` sibling; Mavis
+  runs `command` through the host shell, so arguments are quoted per platform.
+  No script is staged, and the native capture-policy enforcement path is
+  preserved (a staged shell bundle cannot enforce capture-policy capability
+  v1). Nine events are installed:
   `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
   `PreCompact`, `Stop`, `SessionEnd`, `SubagentStart`, `SubagentStop`. Mavis
   injects `SessionStart` stdout as model context via

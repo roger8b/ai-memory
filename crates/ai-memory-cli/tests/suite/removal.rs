@@ -1,7 +1,7 @@
 //! End-to-end: add hooks into a temp HOME, then remove them, and
 //! assert the file round-trips (our entries gone, third-party intact).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
@@ -48,7 +48,10 @@ fn command_with_home(home: &Path) -> Command {
         .env_remove("CLAUDE_CONFIG_DIR")
         // A host-level PI_CODING_AGENT_DIR would send the pi/omp extension
         // uninstall to the developer's real agent dir instead of the sandbox.
-        .env_remove("PI_CODING_AGENT_DIR");
+        .env_remove("PI_CODING_AGENT_DIR")
+        // Same for the Mavis plugin package: an exported MINIMAX_DATA_DIR
+        // would point the sweep at the developer's real ~/.minimax profile.
+        .env_remove("MINIMAX_DATA_DIR");
     command
 }
 
@@ -1650,4 +1653,284 @@ fn default_uninstall_removes_installed_kimi_code_flavored_url() {
         "the exact flavored URL install-mcp writes must be removed"
     );
     assert!(after["mcpServers"].get("other").is_some());
+}
+
+// ---- MiniMax Code (Mavis) round trips -------------------------------
+//
+// Mavis is integrated through a *package* rather than a settings
+// document, so these exercise the tree the installer creates and prove the
+// uninstall contract holds for it too: ours disappears, the operator's
+// icon and every sibling plugin survive.
+
+fn mavis_root(home: &Path) -> PathBuf {
+    home.join(".minimax/plugins/ai-memory-mavis")
+}
+
+#[test]
+fn mavis_hooks_install_creates_the_documented_package() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+
+    let output = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "mavis", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let root = mavis_root(home.path());
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".minimax-plugin/plugin.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["name"], "ai-memory-mavis");
+    assert_eq!(manifest["hooks"][0], "hooks/hooks.json");
+    assert!(manifest["apps"].as_array().is_some_and(|a| a.is_empty()));
+
+    let hooks: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("hooks/hooks.json")).unwrap())
+            .unwrap();
+    let events = hooks["hooks"].as_object().expect("hooks map");
+    assert_eq!(events.len(), 9, "nine Mavis lifecycle events");
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PreCompact",
+        "Stop",
+        "SessionEnd",
+        "SubagentStart",
+        "SubagentStop",
+    ] {
+        assert!(events.contains_key(event), "missing {event}");
+        let handler = &events[event][0]["hooks"][0];
+        assert_eq!(handler["type"], "command");
+        let command = handler["command"].as_str().expect("command");
+        // The regression that shipped broken: one `hook`, no stray positional.
+        assert_eq!(
+            command.split_whitespace().filter(|t| *t == "hook").count(),
+            1,
+            "{event} command must invoke `hook` exactly once: {command}"
+        );
+        assert!(command.contains("--agent mavis"), "{event}: {command}");
+        assert!(
+            handler.get("commandWindows").is_some(),
+            "{event} needs a Windows variant"
+        );
+    }
+    // No matcher: the capture policy, not a name filter, decides what is kept.
+    assert!(events["PreToolUse"][0].get("matcher").is_none());
+    assert!(events["PostToolUse"][0].get("matcher").is_none());
+
+    // A valid PNG is required by the manifest.
+    let icon = std::fs::read(root.join("icon.png")).unwrap();
+    assert_eq!(&icon[..8], b"\x89PNG\r\n\x1a\n", "icon must be a real PNG");
+}
+
+#[test]
+fn mavis_hooks_uninstall_removes_ours_but_keeps_icon_and_sibling_plugins() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let root = mavis_root(home.path());
+
+    // A neighbouring plugin the user installed, which uninstall must never
+    // touch.
+    let sibling = home.path().join(".minimax/plugins/their-plugin");
+    write_file(
+        &sibling.join(".minimax-plugin/plugin.json"),
+        r#"{"schemaVersion":1,"name":"their-plugin"}"#,
+    );
+
+    let install = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "mavis", "--apply"])
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+
+    // Operator-supplied artwork: re-apply and uninstall must both preserve it.
+    let custom_icon = b"CUSTOM-ICON-BYTES";
+    std::fs::write(root.join("icon.png"), custom_icon).unwrap();
+
+    // Re-apply must be idempotent and must not clobber the custom icon.
+    let reapply = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "mavis", "--apply"])
+        .output()
+        .unwrap();
+    assert!(reapply.status.success());
+    assert_eq!(
+        std::fs::read(root.join("icon.png")).unwrap(),
+        custom_icon,
+        "re-apply must not overwrite an existing icon"
+    );
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+
+    assert!(
+        !root.join(".minimax-plugin/plugin.json").exists(),
+        "our manifest must be removed"
+    );
+    assert!(
+        !root.join("hooks/hooks.json").exists(),
+        "our hooks must be removed"
+    );
+    assert!(
+        root.join("icon.png").exists(),
+        "an operator-supplied icon must survive uninstall"
+    );
+    assert!(
+        sibling.join(".minimax-plugin/plugin.json").exists(),
+        "a neighbouring plugin must never be touched"
+    );
+}
+
+#[test]
+fn mavis_uninstall_keeps_a_hand_edited_hooks_document() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let root = mavis_root(home.path());
+
+    let install = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "mavis", "--apply"])
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+
+    // The user adds their own linter handler to the generated document.
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("hooks/hooks.json")).unwrap())
+            .unwrap();
+    doc["hooks"]["PreToolUse"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "type": "command",
+            "command": "my-linter run --agent mavis",
+            "timeout": 5
+        }));
+    std::fs::write(
+        root.join("hooks/hooks.json"),
+        serde_json::to_string(&doc).unwrap(),
+    )
+    .unwrap();
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .output()
+        .unwrap();
+    assert!(uninstall.status.success());
+
+    assert!(
+        root.join("hooks/hooks.json").exists(),
+        "a document containing a foreign handler must NOT be deleted"
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("hooks/hooks.json")).unwrap())
+            .unwrap();
+    let handlers = after["hooks"]["PreToolUse"][0]["hooks"]
+        .as_array()
+        .expect("handlers");
+    assert!(
+        handlers
+            .iter()
+            .any(|h| h["command"] == "my-linter run --agent mavis"),
+        "the user's own handler must be preserved"
+    );
+    assert!(
+        !handlers.iter().any(|h| h["command"]
+            .as_str()
+            .is_some_and(|c| c.contains("hook --event"))),
+        "our own handlers should still have been withdrawn"
+    );
+}
+
+#[test]
+fn mavis_mcp_install_and_uninstall_round_trip_preserves_siblings() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let mcp = home.path().join(".minimax/mcp.json");
+    write_file(
+        &mcp,
+        r#"{"mcpServers":{"other":{"type":"http","url":"https://other.example/mcp"}}}"#,
+    );
+
+    let install = command_with_home(home.path())
+        .args(["install-mcp", "--client", "mavis", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(installed["mcpServers"]["ai-memory"]["type"], "http");
+    assert_eq!(installed["mcpServers"]["ai-memory"]["enabled"], true);
+    // Runtime bookkeeping keys are state Mavis derives; we must not assert them.
+    assert!(
+        installed["mcpServers"]["ai-memory"]
+            .get("configured")
+            .is_none(),
+        "must not write the runtime's `configured` key"
+    );
+    assert!(
+        installed["mcpServers"]["ai-memory"]
+            .get("builtin")
+            .is_none(),
+        "must not write the runtime's `builtin` key"
+    );
+    assert_eq!(
+        installed["mcpServers"]["other"]["url"], "https://other.example/mcp",
+        "install must preserve sibling servers"
+    );
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "mcp", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let removed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(removed["mcpServers"].get("ai-memory").is_none());
+    assert_eq!(
+        removed["mcpServers"]["other"]["url"], "https://other.example/mcp",
+        "uninstall must preserve sibling servers"
+    );
+}
+
+#[test]
+fn mavis_dry_run_writes_nothing() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+
+    let output = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "mavis"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("plugin.json"),
+        "dry run should print the manifest"
+    );
+    assert!(
+        !mavis_root(home.path()).exists(),
+        "dry run must not create the package"
+    );
 }
