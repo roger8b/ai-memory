@@ -708,6 +708,16 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // `tool_observation_metadata` but absent here stores every tool
             // observation with an empty title and body.
             | AgentKind::Mavis
+            // Kiro CLI posts Claude Code's `tool_name` on its tool hooks, so
+            // `tool_observation_metadata` recognizes it — but it was missing
+            // from this list, the #931 failure mode: its tool observations
+            // fell through to `legacy_tool_body`, which only answers for
+            // OpenCode, and were stored with an empty title AND body.
+            //
+            // This is strictly MORE information than before, and still
+            // bounded: `safe_tool_body` emits tool family, call id and
+            // outcome — never raw tool output.
+            | AgentKind::KiroCli
     )
 }
 
@@ -722,18 +732,12 @@ mod closed_tool_agent_drift {
 
     /// The agents this crate's capture policy knows how to read a tool name
     /// and id for, and which store a closed (metadata-only) tool body.
-    ///
-    /// `KiroCli` is deliberately absent from BOTH lists here: it does carry
-    /// tool metadata, but it is not in `closed_tool_agent` upstream, which is
-    /// a pre-existing divergence outside the scope of the Mavis work. It is
-    /// listed in neither the assertion below nor as a claimed pass, so
-    /// fixing Kiro's body handling is a separate, deliberate change rather
-    /// than something this branch smuggles in.
     const AGENTS_WITH_TOOL_METADATA: &[AgentKind] = &[
         AgentKind::ClaudeCode,
         AgentKind::CommandCode,
         AgentKind::Codex,
         AgentKind::Grok,
+        AgentKind::KiroCli,
         AgentKind::Mavis,
         AgentKind::OpenCode,
         AgentKind::Pi,
@@ -756,23 +760,10 @@ mod closed_tool_agent_drift {
         }
     }
 
-    /// Kiro CLI is a KNOWN, NOT-YET-FIXED instance of #931: its tool payloads
-    /// yield metadata, but it is absent from `closed_tool_agent`, so its tool
-    /// observations are stored with an empty title and body.
-    ///
-    /// This is `#[ignore]`d rather than quietly omitted on purpose. Writing a
-    /// guard that skips a known-failing agent certifies a broken behaviour as
-    /// correct; this way the failure is recorded, discoverable with
-    /// `--ignored`, and flips to a normal failure the moment someone fixes
-    /// Kiro without updating this list.
-    #[test]
-    #[ignore = "KiroCli has tool metadata but is not a closed tool agent (#931); fix in a dedicated change"]
-    fn kiro_cli_needs_the_same_closed_tool_agent_treatment() {
-        assert!(
-            closed_tool_agent(AgentKind::KiroCli),
-            "KiroCli tool observations still store an empty title and body (#931)"
-        );
-    }
+    // The list above is the real guard — dropping KiroCli from
+    // `closed_tool_agent` fails `every_agent_with_tool_metadata_is_a_closed_
+    // tool_agent`. The behavioural counterpart lives in the sibling `tests`
+    // module, which can build a `HookEnvelope` this one cannot.
 }
 
 fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
@@ -2457,6 +2448,50 @@ mod tests {
         assert!(
             body.contains("MARKER_MAVIS"),
             "mavis tool_response should be serialized into the body: {body:?}"
+        );
+    }
+
+    /// Kiro CLI's counterpart of the #931 regression: it posts a tool name,
+    /// so before it joined `closed_tool_agent` these observations were stored
+    /// with an empty title and body. Assert the outcome, not just the flag.
+    #[test]
+    fn kiro_cli_post_tool_keeps_a_bounded_title_and_body() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("kiro-cli".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "tool_name": "execute_bash",
+                "tool_input": {"command": "ls"},
+                "tool_use_id": "call_kiro_1",
+                "tool_response": {"stdout": "file.txt"},
+            }),
+        );
+        let title = env
+            .title_hint
+            .expect("a Kiro tool observation must not have an empty title");
+        assert!(
+            !title.trim().is_empty(),
+            "title must carry content: {title:?}"
+        );
+        let body = env
+            .body_excerpt
+            .expect("a Kiro tool observation must not have an empty body");
+        assert!(!body.trim().is_empty(), "body must carry content: {body:?}");
+        // The invariant is not "no output" — `safe_tool_body` deliberately
+        // appends a bounded excerpt of the result. The invariant is that the
+        // safe metadata leads and the whole thing stays under the cap.
+        assert!(
+            body.starts_with("tool_family:"),
+            "the body must lead with the safe metadata summary: {body:?}"
+        );
+        assert!(
+            body.len() <= OBSERVATION_BODY_MAX_BYTES,
+            "body must stay within the observation cap: {} bytes",
+            body.len()
         );
     }
 
