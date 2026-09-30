@@ -1789,6 +1789,11 @@ fn mavis_hooks_uninstall_removes_ours_but_keeps_icon_and_sibling_plugins() {
         root.join("icon.png").exists(),
         "an operator-supplied icon must survive uninstall"
     );
+    assert_eq!(
+        std::fs::read(root.join("icon.png")).unwrap(),
+        custom_icon,
+        "uninstall must not replace operator artwork with the generated placeholder"
+    );
     assert!(
         sibling.join(".minimax-plugin/plugin.json").exists(),
         "a neighbouring plugin must never be touched"
@@ -2016,7 +2021,18 @@ fn mavis_empty_data_dir_override_falls_back_to_the_default() {
 
     // An exported-but-empty MINIMAX_DATA_DIR must not resolve to a relative
     // "mcp.json" in the current directory. It has to fall back to
-    // $HOME/.minimax like an unset variable does.
+    // $HOME/.minimax like an unset variable does. `install-mcp` is exercised
+    // too: a regression would write mcp.json into the crate directory.
+    let mcp = command_with_home(home.path())
+        .env("MINIMAX_DATA_DIR", "")
+        .args(["install-mcp", "--client", "mavis", "--apply"])
+        .output()
+        .unwrap();
+    assert!(mcp.status.success());
+    assert!(
+        home.path().join(".minimax/mcp.json").exists(),
+        "an empty override must send the MCP config to $HOME/.minimax, not the cwd"
+    );
     let install = command_with_home(home.path())
         .env("MINIMAX_DATA_DIR", "")
         .args(["install-hooks", "--agent", "mavis", "--apply"])

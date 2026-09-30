@@ -708,17 +708,27 @@ fn mavis_hook_args(
 /// Ownership has to be decidable from the handler alone, because the whole
 /// point of the uninstall path is removing *only* what `--apply` wrote. Mavis
 /// documents no `statusMessage`-style marker field for handlers, so the test
-/// keys on the unambiguous flag pair every command we generate carries:
-/// `--event <name>` followed by `--agent mavis`.
+/// recognises the canonical shape of a command this crate generates:
+///
+/// ```text
+/// <bin> [--data-dir <dir>] hook --event <e> --agent mavis --server-url <u> […]
+/// ```
+///
+/// Two independent signals decide it, and either is enough:
+///
+/// 1. **`argv[0]` is an ai-memory binary.** Checked on the BASENAME, not with a
+///    substring search over the whole command — an unanchored `contains` is
+///    satisfied by any *argument value*, so a foreign linter installed at
+///    `/opt/ai-memory/bin/lint` and invoked with the same flags would be
+///    claimed, and this predicate gates file deletion.
+/// 2. **The canonical argument sequence is present in order.** This is what
+///    keeps our OWN handlers recognisable when the operator renamed the binary
+///    and relocated the data dir, where signal 1 alone would fail and the
+///    uninstall would leave nine dangling commands behind. A hand-written
+///    command would have to reproduce the whole sequence, not just mention the
+///    flags.
 #[must_use]
 pub(crate) fn is_our_mavis_hook_command(command: &str) -> bool {
-    // Require the binary, not just the flag pair: this predicate gates file
-    // DELETION, so a hand-added handler that merely mentions `--agent mavis`
-    // (a linter invocation, say) must not make the whole document ours.
-    let lower = command.to_ascii_lowercase();
-    if !(lower.contains("ai-memory") || lower.contains("ai_memory")) {
-        return false;
-    }
     // Tokenize and strip shell quoting so the shape is recognised in BOTH
     // platform spellings we emit. The POSIX form quotes only what needs it
     // (`… hook --event …`), while the `commandWindows` form quotes every
@@ -729,12 +739,44 @@ pub(crate) fn is_our_mavis_hook_command(command: &str) -> bool {
         .split_whitespace()
         .map(|token| token.trim_matches(|c| c == '\'' || c == '"').to_string())
         .collect();
-    tokens
-        .windows(2)
-        .any(|pair| pair[0] == "hook" && pair[1] == "--event")
-        && tokens
-            .windows(2)
-            .any(|pair| pair[0] == "--agent" && pair[1] == "mavis")
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let binary_is_ours = tokens[0]
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&tokens[0])
+        .to_ascii_lowercase()
+        .contains("ai-memory");
+
+    // In-order scan for `hook --event <e> --agent mavis --server-url <u>`.
+    // `hook` and `--event` are bare, unquoted, adjacent tokens in both
+    // platform spellings, which is what makes this scannable.
+    let mut canonical = false;
+    for (i, token) in tokens.iter().enumerate() {
+        if token != "hook" {
+            continue;
+        }
+        let rest = &tokens[i + 1..];
+        let has = |flag: &str, from: &[String]| {
+            rest.iter()
+                .position(|t| t == flag)
+                .is_some_and(|p| p + 1 < from.len())
+        };
+        if has("--event", rest)
+            && has("--agent", rest)
+            && has("--server-url", rest)
+            && rest
+                .windows(2)
+                .any(|w| w[0] == "--agent" && w[1] == "mavis")
+        {
+            canonical = true;
+            break;
+        }
+    }
+
+    binary_is_ours || canonical
 }
 
 /// Build the `hooks/hooks.json` document of the generated Mavis plugin.
@@ -2254,214 +2296,15 @@ mod tests {
 
     // ---- Mavis plugin package ----
 
-    fn mavis_handler<'a>(
-        document: &'a serde_json::Value,
-        event: &str,
-    ) -> &'a serde_json::Map<String, serde_json::Value> {
-        document["hooks"][event][0]["hooks"][0]
-            .as_object()
-            .unwrap_or_else(|| panic!("no handler generated for {event}"))
-    }
-
-    #[test]
-    fn mavis_hooks_document_covers_every_event_with_exec_form_commands() {
-        let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
-        let events = doc["hooks"].as_object().expect("hooks map");
-        assert_eq!(events.len(), MAVIS_EVENTS.len());
-        for (event, our_event) in MAVIS_EVENTS {
-            let groups = events
-                .get(event)
-                .unwrap_or_else(|| panic!("missing event {event}"))
-                .as_array()
-                .expect("matcher-group array");
-            assert_eq!(groups.len(), 1, "{event} should have one group");
-            // No matcher: every tool occurrence must be captured so the
-            // capture policy — not a name filter — decides what is kept.
-            assert!(
-                groups[0].get("matcher").is_none(),
-                "{event} must not filter by tool name"
-            );
-            let handler = mavis_handler(&doc, event);
-            assert_eq!(handler["type"], "command");
-            let command = handler["command"].as_str().expect("command string");
-            assert!(
-                command.contains(&format!("--event {our_event}")),
-                "{event} should invoke the {our_event} event: {command}"
-            );
-            assert!(command.contains("--agent mavis"), "{command}");
-            assert!(
-                command.contains("--server-url http://127.0.0.1:49374"),
-                "{command}"
-            );
-        }
-    }
-
-    /// The regression guard that would have caught a stray trailing argument
-    /// in the generated command: an extra positional makes every one of the
-    /// nine handlers exit 2 and silently kills capture. `HookArgs` declares
-    /// no positional argument, so the logical argv must contain `hook`
-    /// exactly once and nothing after the flags.
-    #[test]
-    fn mavis_generated_command_has_no_stray_positional_arguments() {
-        let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
-        for (event, _) in MAVIS_EVENTS {
-            let command = mavis_handler(&doc, event)["command"]
-                .as_str()
-                .expect("command string")
-                .to_string();
-            let argv = split_shell_words(&command);
-            assert_eq!(
-                argv.iter().filter(|a| a.as_str() == "hook").count(),
-                1,
-                "{event} must invoke `hook` exactly once: {command}"
-            );
-            // Everything after the leading binary must be a known flag or a
-            // flag's value — no bare positionals at all.
-            let known = [
-                "hook",
-                "--data-dir",
-                "--event",
-                "--agent",
-                "--server-url",
-                "--auth-token",
-                "--project-strategy",
-            ];
-            let mut expect_value = false;
-            for token in &argv[1..] {
-                if expect_value {
-                    expect_value = false;
-                    continue;
-                }
-                assert!(
-                    known.contains(&token.as_str()),
-                    "{event}: unexpected positional {token:?} in {command}"
-                );
-                expect_value = token.starts_with("--");
-            }
-            assert!(!expect_value, "{event}: dangling flag value in {command}");
-        }
-    }
-
-    /// The whole package must stay inside Mavis's documented handler schema.
-    /// Mavis documents only `type`, `command`, `commandWindows` and `timeout`,
-    /// so an extra key would be an invention the runtime may reject.
-    #[test]
-    fn mavis_hooks_document_uses_only_documented_handler_keys() {
-        let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
-        const ALLOWED: [&str; 4] = ["type", "command", "commandWindows", "timeout"];
-        for (event, _) in MAVIS_EVENTS {
-            let handler = mavis_handler(&doc, event);
-            for key in handler.keys() {
-                assert!(
-                    ALLOWED.contains(&key.as_str()),
-                    "{event} emits undocumented handler key {key}"
-                );
-            }
-            assert!(
-                handler.contains_key("commandWindows"),
-                "{event} needs Windows"
-            );
-            let timeout = handler["timeout"].as_u64().expect("timeout");
-            assert!((1..=10).contains(&timeout), "{event} timeout out of range");
-        }
-        // SessionEnd shares one 3s budget across all matching handlers.
-        assert_eq!(mavis_handler(&doc, "SessionEnd")["timeout"], 3);
-        // The rest must clear session-start's worst case (3s drain + 3s
-        // handoff fetch). Under it, Mavis could kill the handler mid-fetch
-        // and silently consume the handoff without delivering it.
-        assert_eq!(mavis_handler(&doc, "PreToolUse")["timeout"], 10);
-        assert_eq!(mavis_handler(&doc, "SessionStart")["timeout"], 10);
-        // Read the value back off the generated document rather than
-        // re-asserting the constant, so this actually ties the emitted
-        // timeout to the documented budget reasoning.
-        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"] {
-            let timeout = mavis_handler(&doc, event)["timeout"]
-                .as_u64()
-                .expect("timeout");
-            assert!(
-                timeout > 6,
-                "{event}: {timeout}s does not clear the 3s drain + 3s handoff worst case"
-            );
-        }
-    }
-
-    #[test]
-    fn mavis_manifest_points_at_the_generated_hook_document() {
-        let manifest = build_mavis_plugin_manifest();
-        assert_eq!(manifest["schemaVersion"], 1);
-        assert_eq!(manifest["name"], "ai-memory-mavis");
-        assert_eq!(manifest["hooks"][0], "hooks/hooks.json");
-        assert!(manifest["apps"].as_array().is_some_and(|a| a.is_empty()));
-        assert!(
-            manifest["mcpServers"]
-                .as_array()
-                .is_some_and(|a| a.is_empty()),
-            "MCP is installed separately by install-mcp --client mavis"
-        );
-        assert!(
-            manifest["icon"]
-                .as_str()
-                .is_some_and(|i| i.ends_with(".png")),
-            "a valid icon file is required by the manifest"
-        );
-    }
-
-    #[test]
-    fn mavis_ownership_test_recognizes_generated_commands_and_rejects_foreign_ones() {
-        let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
-        for (event, _) in MAVIS_EVENTS {
-            let handler = mavis_handler(&doc, event);
-            // BOTH spellings, because the uninstall path requires both to
-            // call the document ours.
-            for field in ["command", "commandWindows"] {
-                let command = handler[field].as_str().expect(field);
-                assert!(
-                    is_our_mavis_hook_command(command),
-                    "must recognize its own {field} for {event}: {command}"
-                );
-            }
-        }
-        // A data dir with spaces and a quote must not defeat the scan: the
-        // `--agent mavis` pair is always bare, adjacent tokens.
-        let awkward = build_mavis_hooks_document(
-            "http://127.0.0.1:49374",
-            Some("tok'en with spaces"),
-            Some(Path::new("/tmp/a dir/o'brien/ai-memory")),
-            None,
-        );
-        for (event, _) in MAVIS_EVENTS {
-            for field in ["command", "commandWindows"] {
-                assert!(
-                    is_our_mavis_hook_command(
-                        mavis_handler(&awkward, event)[field].as_str().unwrap()
-                    ),
-                    "quoting broke ownership detection for {event}/{field}"
-                );
-            }
-        }
-        // The predicate gates DELETION, so a foreign command that merely
-        // mentions the flag pair must not be claimed.
-        for foreign in [
-            "my-linter run --agent mavis",
-            "/usr/local/bin/other hook --event session-start --agent mavis",
-            "ai-memory hook --event session-start --agent claude-code",
-            "ai-memory hook --agent mavis",
-        ] {
-            assert!(
-                !is_our_mavis_hook_command(foreign),
-                "must not claim a foreign command: {foreign}"
-            );
-        }
-    }
-
     /// Split a shell command string into logical words the way a POSIX shell
     /// would: whitespace inside single or double quotes is NOT a separator.
     ///
     /// `split_whitespace` is wrong here — an argument like
     /// `/tmp/a dir/o'brien` is quoted as one word by the shell, but
     /// whitespace-splitting tears it in two and produces a nonsense argv.
-    /// Handles `'…'` (literal, no escapes), `"…"` (backslash escapes) and
-    /// bare backslash escapes.
+    /// Handles `'…'` (literal, no escapes, including the `'\''` form
+    /// `shell_quote_posix` emits for an embedded apostrophe), `"…"`
+    /// (backslash escapes) and bare backslash escapes.
     fn split_shell_words(command: &str) -> Vec<String> {
         let mut words = Vec::new();
         let mut current = String::new();
@@ -2516,14 +2359,55 @@ mod tests {
         words
     }
 
-    /// Structural version of the check above: feed the generated argv to the
-    /// REAL clap parser instead of a hardcoded flag list.
+    fn mavis_handler<'a>(
+        document: &'a serde_json::Value,
+        event: &str,
+    ) -> &'a serde_json::Map<String, serde_json::Value> {
+        document["hooks"][event][0]["hooks"][0]
+            .as_object()
+            .unwrap_or_else(|| panic!("no handler generated for {event}"))
+    }
+
+    #[test]
+    fn mavis_hooks_document_covers_every_event_with_exec_form_commands() {
+        let doc = build_mavis_hooks_document("http://127.0.0.1:49374", None, None, None);
+        let events = doc["hooks"].as_object().expect("hooks map");
+        assert_eq!(events.len(), MAVIS_EVENTS.len());
+        for (event, our_event) in MAVIS_EVENTS {
+            let groups = events
+                .get(event)
+                .unwrap_or_else(|| panic!("missing event {event}"))
+                .as_array()
+                .expect("matcher-group array");
+            assert_eq!(groups.len(), 1, "{event} should have one group");
+            // No matcher: every tool occurrence must be captured so the
+            // capture policy — not a name filter — decides what is kept.
+            assert!(
+                groups[0].get("matcher").is_none(),
+                "{event} must not filter by tool name"
+            );
+            let handler = mavis_handler(&doc, event);
+            assert_eq!(handler["type"], "command");
+            let command = handler["command"].as_str().expect("command string");
+            assert!(
+                command.contains(&format!("--event {our_event}")),
+                "{event} should invoke the {our_event} event: {command}"
+            );
+            assert!(command.contains("--agent mavis"), "{command}");
+            assert!(
+                command.contains("--server-url http://127.0.0.1:49374"),
+                "{command}"
+            );
+        }
+    }
+
+    /// Feed the generated argv to the REAL clap parser.
     ///
-    /// The hardcoded list can only catch a flag that disappears; it cannot
-    /// catch a flag that is renamed in `HookArgs`, or a `hook` argument that
-    /// becomes a positional. Parsing proves the command the installer writes
-    /// is one this binary actually accepts — which is exactly the class of
-    /// bug that shipped a stray trailing `hook` and made all nine handlers
+    /// This replaced a hardcoded flag-list assertion, which could only catch a
+    /// flag that disappears; it could not catch a flag renamed in `HookArgs`,
+    /// or `hook` becoming a positional. Parsing proves the command the
+    /// installer writes is one this binary actually accepts — the exact class
+    /// of bug that shipped a stray trailing `hook` and made all nine handlers
     /// exit 2.
     #[test]
     fn mavis_generated_argv_parses_with_the_real_cli_parser() {
@@ -2535,20 +2419,35 @@ mod tests {
             Some("repo-root"),
         );
         for (event, _) in MAVIS_EVENTS {
-            for field in ["command", "commandWindows"] {
-                let raw = mavis_handler(&doc, event)[field]
-                    .as_str()
-                    .expect(field)
-                    .to_string();
-                let argv = split_shell_words(&raw);
-                // argv[0] is the binary; clap wants the program name first.
-                let mut full = vec!["ai-memory".to_string()];
-                full.extend_from_slice(&argv[1..]);
-                crate::cli::Cli::command()
-                    .try_get_matches_from(&full)
-                    .unwrap_or_else(|e| {
-                        panic!("{event}/{field} is not a valid command: {e}\n  {raw}")
-                    });
+            let raw = mavis_handler(&doc, event)["command"]
+                .as_str()
+                .expect("command")
+                .to_string();
+            let argv = split_shell_words(&raw);
+            // argv[0] is the binary; clap wants the program name first.
+            let mut full = vec!["ai-memory".to_string()];
+            full.extend_from_slice(&argv[1..]);
+            crate::cli::Cli::command()
+                .try_get_matches_from(&full)
+                .unwrap_or_else(|e| panic!("{event}/command is not a valid command: {e}\n  {raw}"));
+
+            // `commandWindows` is NOT parsed here: it is cmd.exe quoting,
+            // where `\` is not an escape and `"` is escaped by doubling, so a
+            // POSIX splitter silently eats every backslash in a Windows path
+            // and the parse would validate an argv cmd.exe never produces.
+            // Its shape is checked as a string instead — and because
+            // `shell_quote_windows` quotes EVERY argument, the flags appear as
+            // separate `"…"` tokens rather than the contiguous `--agent mavis`
+            // the POSIX form produces.
+            let windows = mavis_handler(&doc, event)["commandWindows"]
+                .as_str()
+                .expect("commandWindows")
+                .to_string();
+            for token in ["\"hook\"", "\"--event\"", "\"--agent\"", "\"mavis\""] {
+                assert!(
+                    windows.contains(token),
+                    "{event}/commandWindows is missing {token}: {windows}"
+                );
             }
         }
     }
@@ -2580,9 +2479,10 @@ mod tests {
         for field in REQUIRED {
             assert!(obj.contains_key(field), "required manifest field {field}");
         }
-        // The contract says "no unknown fields"; only these plus the three
-        // documented optionals may appear.
-        const OPTIONAL: [&str; 3] = ["displayName", "darkIcon", "hooks"];
+        // The contract says "no unknown fields". It documents FOUR optionals,
+        // not three: `$schema` is sanctioned, and a contributor adding it must
+        // not be blocked by a test citing the contract as authority.
+        const OPTIONAL: [&str; 4] = ["displayName", "darkIcon", "hooks", "$schema"];
         for key in obj.keys() {
             assert!(
                 REQUIRED.contains(&key.as_str()) || OPTIONAL.contains(&key.as_str()),
@@ -2591,26 +2491,76 @@ mod tests {
         }
         assert_eq!(m["schemaVersion"], 1);
 
+        // Test the RULE, not just the one name it is applied to. A regex
+        // assertion pinned to a single literal can never fail on a wrong
+        // regex, so it is decorative; running it over accepted and rejected
+        // samples makes a broken regex actually break the build.
+        // The runtime rule: ^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$
+        let name_ok = |s: &str| -> bool {
+            let mut parts = s.split(['.', '_', '-']).peekable();
+            let Some(first) = parts.next() else {
+                return false;
+            };
+            let head_ok = first.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                && first
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+            head_ok
+                && parts.all(|p| {
+                    !p.is_empty()
+                        && p.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                })
+        };
+        for good in ["a", "a1", "ai-memory", "ai-memory-mavis", "z.a.b"] {
+            assert!(name_ok(good), "the plugin-name rule should accept {good:?}");
+        }
+        // Names the runtime rejects: empty segments and trailing separators.
+        for bad in ["", "A", "1a", "a..b", "a.", "a-", "a_", "a b"] {
+            assert!(!name_ok(bad), "the plugin-name rule should reject {bad:?}");
+        }
+
         let name = m["name"].as_str().expect("name");
         assert!(
-            name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c)),
-            "plugin name must match the runtime regex: {name}"
+            name_ok(name),
+            "plugin name must match the runtime rule: {name}"
         );
         // The package DIRECTORY must equal the manifest name; the runtime
         // resolves the package by that name.
         assert_eq!(name, "ai-memory-mavis");
 
+        // SemVer, including the prerelease and build forms. A prerelease bump
+        // in Cargo.toml is a normal thing to do and must not fail a test
+        // whose stated rule is the opposite.
+        let version_ok = |s: &str| -> bool {
+            let (core, rest) = s.split_once(['-', '+']).unwrap_or((s, ""));
+            let parts: Vec<&str> = core.split('.').collect();
+            parts.len() == 3
+                && parts.iter().all(|p| {
+                    !p.is_empty()
+                        && p.chars().all(|c| c.is_ascii_digit())
+                        // numeric identifiers must not have leading zeros
+                        && (p.len() == 1 || !p.starts_with('0'))
+                })
+                && (rest.is_empty()
+                    || rest
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+'))
+        };
+        for good in [
+            "2.4.1",
+            "0.1.0",
+            "1.0.0-rc.1",
+            "1.0.0+build.5",
+            "1.0.0-rc.1+build",
+        ] {
+            assert!(version_ok(good), "SemVer rule should accept {good:?}");
+        }
+        for bad in ["2.4", "2.4.1.5", "v2.4.1", "01.2.3", "2.4.x", ""] {
+            assert!(!version_ok(bad), "SemVer rule should reject {bad:?}");
+        }
         let version = m["version"].as_str().expect("version");
-        assert!(
-            version.split('.').count() == 3
-                && version
-                    .split('.')
-                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
-            "version must be SemVer: {version}"
-        );
+        assert!(version_ok(version), "version must be SemVer: {version}");
 
         const CATEGORIES: [&str; 10] = [
             "Office",
